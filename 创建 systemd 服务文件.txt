@@ -1,0 +1,106 @@
+创建 systemd 服务文件
+创建 /etc/systemd/system/dockerhost.service：
+[Unit]
+Description=Docker Host GUID Service
+Documentation=https://your-docs-url
+After=network.target
+Wants=network.target
+
+[Service]
+Type=notify
+ExecStart=/opt/dockerhost/DockerHost
+WorkingDirectory=/opt/dockerhost
+Restart=always
+RestartSec=5
+TimeoutStartSec=0
+
+# 用户和组
+User=dockerhost
+Group=dockerhost
+
+# 环境变量
+Environment=DOTNET_ENVIRONMENT=Production
+Environment=ASPNETCORE_ENVIRONMENT=Production
+
+# 日志配置
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=dockerhost
+
+# 安全设置
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/dockerhost
+
+[Install]
+WantedBy=multi-user.target
+
+
+部署脚本
+创建部署脚本 deploy-dockerhost.sh：
+#!/bin/bash
+
+echo "开始部署 DockerHost 服务..."
+
+# 创建专用用户（如果不存在）
+if ! id "dockerhost" &>/dev/null; then
+    sudo useradd -r -s /bin/false dockerhost
+    echo "已创建 dockerhost 用户"
+fi
+
+# 创建目录
+sudo mkdir -p /opt/dockerhost
+echo "已创建服务目录"
+
+# 停止现有服务（如果正在运行）
+if systemctl is-active --quiet dockerhost.service; then
+    sudo systemctl stop dockerhost.service
+    echo "已停止现有服务"
+fi
+
+# 复制文件
+sudo cp ./publish/linux-x64/DockerHost /opt/dockerhost/
+sudo cp ./publish/linux-x64/appsettings.json /opt/dockerhost/
+echo "已复制程序文件"
+
+# 设置权限
+sudo chown -R dockerhost:dockerhost /opt/dockerhost
+sudo chmod +x /opt/dockerhost/DockerHost
+echo "已设置文件权限"
+
+# 安装服务文件
+sudo cp dockerhost.service /etc/systemd/system/
+echo "已安装服务文件"
+
+# 重新加载 systemd
+sudo systemctl daemon-reload
+echo "已重新加载 systemd"
+
+# 启用服务（开机自启）
+sudo systemctl enable dockerhost.service
+echo "已启用服务自启动"
+
+# 启动服务
+sudo systemctl start dockerhost.service
+echo "已启动服务"
+
+# 等待一下让服务启动
+sleep 2
+
+# 检查服务状态
+echo "=== 服务状态 ==="
+sudo systemctl status dockerhost.service --no-pager
+
+echo ""
+echo "=== 最近日志 ==="
+sudo journalctl -u dockerhost.service --no-pager -n 10
+
+echo ""
+echo "部署完成！"
+echo "管理命令："
+echo "  查看状态: sudo systemctl status dockerhost.service"
+echo "  查看日志: sudo journalctl -u dockerhost.service -f"
+echo "  重启服务: sudo systemctl restart dockerhost.service"
+echo "  停止服务: sudo systemctl stop dockerhost.service"
