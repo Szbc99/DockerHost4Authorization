@@ -66,12 +66,47 @@ namespace DockerHost
         {
             var builder = WebApplication.CreateBuilder(args);
 
-            // 移除硬编码的端口配置，Kestrel 将会自动从 appsettings.json 读取配置
-            // builder.WebHost.ConfigureKestrel(serverOptions =>
-            // {
-            //     // 统一在所有平台上监听 5000 端口
-            //     serverOptions.ListenAnyIP(5000);
-            // });
+            // 配置 Kestrel 监听方式
+            builder.WebHost.ConfigureKestrel((context, serverOptions) =>
+            {
+                var communicationSection = context.Configuration.GetSection("Communication");
+                string type = communicationSection.GetValue<string>("Type") ?? "UnixSocket";
+
+                if (type.Equals("UnixSocket", StringComparison.OrdinalIgnoreCase))
+                {
+                    string socketPath = communicationSection.GetValue<string>("UnixSocketPath") ?? "/var/run/dockerhost.sock";
+                    
+                    // 如果 socket 文件已存在，需要先删除，否则会报错
+                    if (File.Exists(socketPath))
+                    {
+                        File.Delete(socketPath);
+                    }
+                    
+                    serverOptions.ListenUnixSocket(socketPath);
+                    Console.WriteLine($"正在监听 Unix Domain Socket: {socketPath}");
+                }
+                else
+                {
+                    int port = communicationSection.GetValue<int>("TcpPort", 5000);
+                    string ipString = communicationSection.GetValue<string>("IpAddress");
+
+                    if (string.IsNullOrWhiteSpace(ipString) || ipString == "*" || ipString == "0.0.0.0")
+                    {
+                        serverOptions.ListenAnyIP(port);
+                        Console.WriteLine($"正在监听 TCP (所有IP) 端口: {port}");
+                    }
+                    else if (System.Net.IPAddress.TryParse(ipString, out var ipAddress))
+                    {
+                        serverOptions.Listen(ipAddress, port);
+                        Console.WriteLine($"正在监听 TCP ({ipAddress}) 端口: {port}");
+                    }
+                    else
+                    {
+                        serverOptions.ListenAnyIP(port);
+                        Console.WriteLine($"配置的 IP 地址无效 ({ipString})，默认监听所有 IP，端口: {port}");
+                    }
+                }
+            });
 
             // 添加对 Systemd 的支持
             builder.Host.UseSystemd();
