@@ -24,11 +24,18 @@ namespace DockerHost
         // 当客户端断开连接时，自动触发此方法
         public override Task OnDisconnectedAsync(Exception? exception)
         {
-            // 尝试从字典中移除断开连接的客户端
-            var disconnectedClientId = _activeClients.FirstOrDefault(kvp => kvp.Value == Context.ConnectionId).Key;
-            if (disconnectedClientId != null)
+            // 4. 服务端与客户端连接中断的时候，要及时清理掉_activeClients中对应的连接ID
+            // 查找当前断开连接对应的 clientId
+            var disconnectedClient = _activeClients.FirstOrDefault(kvp => kvp.Value == Context.ConnectionId);
+            
+            if (!string.IsNullOrEmpty(disconnectedClient.Key))
             {
-                _activeClients.TryRemove(disconnectedClientId, out _);
+                // 只有当字典中存储的 ConnectionId 与当前断开的 ConnectionId 一致时才移除
+                // 这样可以防止：客户端重连后更新了 ConnectionId，而旧连接的断开事件随后触发，导致新连接被误删
+                if (_activeClients.TryRemove(new KeyValuePair<string, string>(disconnectedClient.Key, Context.ConnectionId)))
+                {
+                    Console.WriteLine($"客户端断开连接，已清理 ID: {disconnectedClient.Key}");
+                }
             }
             return base.OnDisconnectedAsync(exception);
         }
@@ -38,16 +45,31 @@ namespace DockerHost
         {
             var currentConnectionId = Context.ConnectionId;
 
-            // 检查此 clientId 是否已存在于不同的连接上
-            if (_activeClients.TryGetValue(clientId, out var existingConnectionId) && existingConnectionId != currentConnectionId)
+            // 4. 确保相同的客户端ID只能有一个活动的连接。
+            // 修改逻辑：如果 clientId 已存在，严格禁止重复连接（除非是同一个连接ID的重复请求）
+            if (_activeClients.TryGetValue(clientId, out var existingConnectionId))
             {
-                // 如果是，则通知新连接的客户端，并终止此操作
-                await Clients.Caller.SendAsync("ClientAlreadyConnected", clientId);
-                return;
+                if (existingConnectionId != currentConnectionId)
+                {
+                    Console.WriteLine($"拒绝重复连接：客户端 {clientId} 已在线 (ConnectionId: {existingConnectionId})。新请求 ConnectionId: {currentConnectionId}");
+                    await Clients.Caller.SendAsync("ClientAlreadyConnected", clientId);
+                    return;
+                }
             }
-
-            // 如果 clientId 不存在，则将其与当前连接ID关联
-            _activeClients.TryAdd(clientId, currentConnectionId);
+            else
+            {
+                // 尝试添加
+                if (!_activeClients.TryAdd(clientId, currentConnectionId))
+                {
+                    // 并发处理：如果添加失败，说明刚刚被其他线程添加了
+                    if (_activeClients.TryGetValue(clientId, out existingConnectionId) && existingConnectionId != currentConnectionId)
+                    {
+                        Console.WriteLine($"拒绝重复连接：客户端 {clientId} 已在线 (ConnectionId: {existingConnectionId})。");
+                        await Clients.Caller.SendAsync("ClientAlreadyConnected", clientId);
+                        return;
+                    }
+                }
+            }
 
             // 1. 获取硬件ID（作为明文）
             var hardwareId = HardwareInfoGenerator.GenerateHardwareInfo();
@@ -70,9 +92,31 @@ namespace DockerHost
             builder.WebHost.ConfigureKestrel((context, serverOptions) =>
             {
                 var communicationSection = context.Configuration.GetSection("Communication");
-                string type = communicationSection.GetValue<string>("Type") ?? "UnixSocket";
+                
+                // 1. 如果服务运行环境是windows，用TCP连接方式；如果是linux，则用UnixSocket。
+                // 不通过配置文件去选择通讯方式，而是由本地的操作系统环境来决定。
+                if (OperatingSystem.IsWindows())
+                {
+                    int port = communicationSection.GetValue<int>("TcpPort", 5000);
+                    string ipString = communicationSection.GetValue<string>("IpAddress");
 
-                if (type.Equals("UnixSocket", StringComparison.OrdinalIgnoreCase))
+                    if (string.IsNullOrWhiteSpace(ipString) || ipString == "*" || ipString == "0.0.0.0")
+                    {
+                        serverOptions.ListenAnyIP(port);
+                        Console.WriteLine($"[Windows环境] 正在监听 TCP (所有IP) 端口: {port}");
+                    }
+                    else if (System.Net.IPAddress.TryParse(ipString, out var ipAddress))
+                    {
+                        serverOptions.Listen(ipAddress, port);
+                        Console.WriteLine($"[Windows环境] 正在监听 TCP ({ipAddress}) 端口: {port}");
+                    }
+                    else
+                    {
+                        serverOptions.ListenAnyIP(port);
+                        Console.WriteLine($"[Windows环境] 配置的 IP 地址无效 ({ipString})，默认监听所有 IP，端口: {port}");
+                    }
+                }
+                else if (OperatingSystem.IsLinux())
                 {
                     string socketPath = communicationSection.GetValue<string>("UnixSocketPath") ?? "/var/run/dockerhost.sock";
                     
@@ -83,28 +127,14 @@ namespace DockerHost
                     }
                     
                     serverOptions.ListenUnixSocket(socketPath);
-                    Console.WriteLine($"正在监听 Unix Domain Socket: {socketPath}");
+                    Console.WriteLine($"[Linux环境] 正在监听 Unix Domain Socket: {socketPath}");
                 }
                 else
                 {
+                    // 其他环境默认使用 TCP
                     int port = communicationSection.GetValue<int>("TcpPort", 5000);
-                    string ipString = communicationSection.GetValue<string>("IpAddress");
-
-                    if (string.IsNullOrWhiteSpace(ipString) || ipString == "*" || ipString == "0.0.0.0")
-                    {
-                        serverOptions.ListenAnyIP(port);
-                        Console.WriteLine($"正在监听 TCP (所有IP) 端口: {port}");
-                    }
-                    else if (System.Net.IPAddress.TryParse(ipString, out var ipAddress))
-                    {
-                        serverOptions.Listen(ipAddress, port);
-                        Console.WriteLine($"正在监听 TCP ({ipAddress}) 端口: {port}");
-                    }
-                    else
-                    {
-                        serverOptions.ListenAnyIP(port);
-                        Console.WriteLine($"配置的 IP 地址无效 ({ipString})，默认监听所有 IP，端口: {port}");
-                    }
+                    serverOptions.ListenAnyIP(port);
+                    Console.WriteLine($"[其他环境] 正在监听 TCP 端口: {port}");
                 }
             });
 
@@ -115,7 +145,17 @@ namespace DockerHost
             builder.Services.AddControllers();
             builder.Services.AddEndpointsApiExplorer();
             builder.Services.AddSwaggerGen();
-            builder.Services.AddSignalR(); // 添加 SignalR 服务
+            
+            // 配置 SignalR 的心跳和超时设置
+            builder.Services.AddSignalR(options =>
+            {
+                // 缩短客户端超时时间，以便服务端更快地清理掉断开的连接 (默认是 30秒)
+                // 这样当客户端因网络断开并尝试重连时，服务端能更快地释放旧的 ClientId
+                options.ClientTimeoutInterval = TimeSpan.FromSeconds(10);
+                
+                // 相应地缩短心跳间隔 (默认是 15秒)，通常设置为超时时间的 1/2 左右
+                options.KeepAliveInterval = TimeSpan.FromSeconds(5);
+            }); 
             
             var app = builder.Build();
 

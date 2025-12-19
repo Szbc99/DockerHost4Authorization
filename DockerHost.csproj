@@ -32,5 +32,11 @@
 		<PackageReference Include="Microsoft.Extensions.Hosting.Systemd" Version="10.0.0" />
 		<PackageReference Include="Swashbuckle.AspNetCore" Version="10.0.1" />
 	</ItemGroup>
+
+	<ItemGroup>
+	  <None Update="部署说明.md">
+	    <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+	  </None>
+	</ItemGroup>
 	
 </Project>
