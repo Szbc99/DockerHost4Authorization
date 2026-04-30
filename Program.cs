@@ -84,8 +84,43 @@ namespace DockerHost
 
     public class Program
     {
+        // 持有凭证锁文件句柄，进程存活期间独占，崩溃/退出时由内核自动释放
+        private static FileStream _licenseLockHandle;
+
+        // 基于硬件注册码抢占文件锁，防止同一物理机运行多个服务端实例
+        private static void AcquireLicenseLock(string hardwareId)
+        {
+            byte[] hash = MD5.HashData(Encoding.UTF8.GetBytes(hardwareId));
+            string hashHex = BitConverter.ToString(hash).Replace("-", "").ToLowerInvariant();
+
+            string lockDir = OperatingSystem.IsLinux() ? "/var/tmp" : Path.GetTempPath();
+            string lockPath = Path.Combine(lockDir, $"gw-auth-{hashHex}.lock");
+
+            try
+            {
+                if (!Directory.Exists(lockDir))
+                    Directory.CreateDirectory(lockDir);
+
+                _licenseLockHandle = new FileStream(lockPath, FileMode.OpenOrCreate,
+                    FileAccess.ReadWrite, FileShare.None);
+                Console.WriteLine($"[凭证锁] 已获取授权锁: {lockPath}");
+            }
+            catch (IOException)
+            {
+                Console.ForegroundColor = ConsoleColor.Red;
+                Console.WriteLine($"[凭证锁] 锁文件被占用: {lockPath}");
+                Console.WriteLine($"[凭证锁] 同授权服务端已在运行，本实例退出。");
+                Console.ResetColor();
+                Environment.Exit(1);
+            }
+        }
+
         public static void Main(string[] args)
         {
+            // 在绑定端口前抢占凭证锁，防止通过修改端口绕过防多开
+            var hardwareId = HardwareInfoGenerator.GenerateHardwareInfo();
+            AcquireLicenseLock(hardwareId);
+
             var builder = WebApplication.CreateBuilder(args);
 
             // 配置 Kestrel 监听方式
@@ -93,8 +128,9 @@ namespace DockerHost
             {
                 var communicationSection = context.Configuration.GetSection("Communication");
                 
-                // 1. 如果服务运行环境是windows，用TCP连接方式；如果是linux，则用UnixSocket。
-                // 不通过配置文件去选择通讯方式，而是由本地的操作系统环境来决定。
+                // 根据操作系统环境自动选择通讯方式：
+                // Windows：TCP 绑定指定 IP
+                // Linux：TCP 绑定 Docker 网桥地址数组（容器内可访问，外部不可达）
                 if (OperatingSystem.IsWindows())
                 {
                     int port = communicationSection.GetValue<int>("TcpPort", 5000);
@@ -118,16 +154,26 @@ namespace DockerHost
                 }
                 else if (OperatingSystem.IsLinux())
                 {
-                    string socketPath = communicationSection.GetValue<string>("UnixSocketPath") ?? "/var/run/dockerhost.sock";
-                    
-                    // 如果 socket 文件已存在，需要先删除，否则会报错
-                    if (File.Exists(socketPath))
+                    int port = communicationSection.GetValue<int>("TcpPort", 5000);
+                    string[] bridgeIps = communicationSection.GetSection("DockerBridgeIps").Get<string[]>()
+                                         ?? new[] { "172.17.0.1" };
+
+                    bool bound = false;
+                    foreach (var ipString in bridgeIps)
                     {
-                        File.Delete(socketPath);
+                        if (System.Net.IPAddress.TryParse(ipString, out var ipAddress))
+                        {
+                            serverOptions.Listen(ipAddress, port);
+                            Console.WriteLine($"[Linux环境] 监听 Docker 网桥 {ipString}:{port}");
+                            bound = true;
+                        }
                     }
-                    
-                    serverOptions.ListenUnixSocket(socketPath);
-                    Console.WriteLine($"[Linux环境] 正在监听 Unix Domain Socket: {socketPath}");
+
+                    if (!bound)
+                    {
+                        serverOptions.Listen(System.Net.IPAddress.Loopback, port);
+                        Console.WriteLine($"[Linux环境] 配置的网桥 IP 均无效，回退监听 127.0.0.1:{port}");
+                    }
                 }
                 else
                 {
@@ -160,7 +206,6 @@ namespace DockerHost
             var app = builder.Build();
 
             // --- 使用矩形框醒目地输出注册码 ---
-            var hardwareId = HardwareInfoGenerator.GenerateHardwareInfo();
             var line1 = $"软件注册码: {hardwareId}";
             var line2 = $"Software registration code: {hardwareId}";
 
@@ -208,27 +253,6 @@ namespace DockerHost
             // 映射 SignalR Hub 端点
             app.MapHub<HardwareHub>("/hardwarehub");
 
-            // 在 Linux 环境下，服务启动后设置 Unix Socket 文件权限
-            if (OperatingSystem.IsLinux())
-            {
-                app.Lifetime.ApplicationStarted.Register(() =>
-                {
-                    var socketPath = app.Configuration.GetSection("Communication").GetValue<string>("UnixSocketPath") ?? "/var/run/dockerhost.sock";
-                    try
-                    {
-                        // 设置 socket 文件权限为 666 (所有用户可读写)
-                        File.SetUnixFileMode(socketPath,
-                            UnixFileMode.UserRead | UnixFileMode.UserWrite |
-                            UnixFileMode.GroupRead | UnixFileMode.GroupWrite |
-                            UnixFileMode.OtherRead | UnixFileMode.OtherWrite);
-                        Console.WriteLine($"[Linux环境] 已设置 Unix Socket 权限 (666): {socketPath}");
-                    }
-                    catch (Exception ex)
-                    {
-                        Console.WriteLine($"[Linux环境] 设置 Unix Socket 权限失败: {ex.Message}");
-                    }
-                });
-            }
 
             app.Run();
         }
