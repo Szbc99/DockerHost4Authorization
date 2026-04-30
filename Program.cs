@@ -1,8 +1,8 @@
-﻿using Hardware.Info;
-using Microsoft.AspNetCore.SignalR; // 添加此 using 指令
-using System.Collections.Concurrent; // 新增 using
+﻿using Microsoft.AspNetCore.SignalR;
+using System.Collections.Concurrent;
 using System.Net.NetworkInformation;
 using System.Net.Sockets;
+using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text;
 
@@ -208,6 +208,28 @@ namespace DockerHost
             // 映射 SignalR Hub 端点
             app.MapHub<HardwareHub>("/hardwarehub");
 
+            // 在 Linux 环境下，服务启动后设置 Unix Socket 文件权限
+            if (OperatingSystem.IsLinux())
+            {
+                app.Lifetime.ApplicationStarted.Register(() =>
+                {
+                    var socketPath = app.Configuration.GetSection("Communication").GetValue<string>("UnixSocketPath") ?? "/var/run/dockerhost.sock";
+                    try
+                    {
+                        // 设置 socket 文件权限为 666 (所有用户可读写)
+                        File.SetUnixFileMode(socketPath,
+                            UnixFileMode.UserRead | UnixFileMode.UserWrite |
+                            UnixFileMode.GroupRead | UnixFileMode.GroupWrite |
+                            UnixFileMode.OtherRead | UnixFileMode.OtherWrite);
+                        Console.WriteLine($"[Linux环境] 已设置 Unix Socket 权限 (666): {socketPath}");
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine($"[Linux环境] 设置 Unix Socket 权限失败: {ex.Message}");
+                    }
+                });
+            }
+
             app.Run();
         }
     }
@@ -252,66 +274,188 @@ namespace DockerHost
         }
     }
 
-    // 生成基于硬件信息的GUID
+    // 生成基于硬件信息的注册码（V2：5段格式，与 DataCenter.GetSbmV2 保持一致）
     public static class HardwareInfoGenerator
     {
+        private static string _cachedHardwareFingerprint = null;
+
         public static string GenerateHardwareInfo()
         {
-            var sb = new StringBuilder();
+            string macAddr = GetPrimaryMacAddress();
 
-            // 获取主板 ID
-            sb.Append(GetMotherboardSerialNumber());
-            // 再获取第一个非虚拟网卡的MAC地址
-            //Console.WriteLine($"第一个标识：{GetMotherboardSerialNumber()}");
-            var macAddress = NetworkInterface.GetAllNetworkInterfaces()
-                .Where(nic => nic.OperationalStatus == OperationalStatus.Up &&
-                                nic.NetworkInterfaceType != NetworkInterfaceType.Loopback &&
-                                !nic.Description.Contains("Virtual", StringComparison.OrdinalIgnoreCase))
-                .Select(nic => nic.GetPhysicalAddress().ToString())
-                .FirstOrDefault();
-            //Console.WriteLine($"第二个标识：{macAddress}");
-            if (!string.IsNullOrEmpty(macAddress.ToString()))
-                sb.Append(macAddress.ToString());
-            // 如果网卡也获取不到，则获取主机名
-            if (sb.Length == 0)
-            {
-                sb.Append(Environment.MachineName);
-                sb.Append("ganweisoft");
-            }
+            // MAC 衍生部分（与 General.GetString1 一致）
+            string macPart = GetString1(macAddr);
 
-           // Console.WriteLine($"第三个标识：{Environment.MachineName}");
+            // 硬件指纹部分（SHA256 前4字节 = 8位大写16进制）
+            string hwPart = GetHardwareFingerprint();
 
-
-            // 生成哈希作为GUID
+            // 拼接后整体做 SHA256，取前10字节 = 20位16进制
+            string raw = macPart + "|" + hwPart;
             using var sha256 = SHA256.Create();
-            var hash = sha256.ComputeHash(Encoding.UTF8.GetBytes(sb.ToString()));
-            //把hash转成大写的字符串
-            var strResult = BitConverter.ToString(hash).Replace("-", "").ToUpperInvariant();
-            //return new Guid(hash.Take(16).ToArray()).ToString();
-            return strResult.Substring(12, 4) + "-" + strResult.Substring(8, 4) + "-" + strResult.Substring(4, 4) + "-" + strResult.Substring(0, 4);
+            byte[] hash = sha256.ComputeHash(Encoding.UTF8.GetBytes(raw));
+
+            // 倒序分组格式化为 XXXX-XXXX-XXXX-XXXX-XXXX
+            string hex = BitConverter.ToString(hash, 0, 10).Replace("-", "").ToUpper();
+            return $"{hex.Substring(16, 4)}-{hex.Substring(12, 4)}-{hex.Substring(8, 4)}-{hex.Substring(4, 4)}-{hex.Substring(0, 4)}";
         }
 
-        // 获取主板 ID的方法
-        public static string GetMotherboardSerialNumber()
+        // 与 General.GetString1 完全一致
+        private static string GetString1(string MacAddr)
+        {
+            string strID = "AlarmCenter1";
+            strID += MacAddr;
+            strID = strID.Replace(':', '8');
+            strID = strID.Replace(' ', 'F');
+            char[] charArray = strID.ToCharArray();
+            Array.Reverse(charArray);
+            strID = new string(charArray).Substring(0, 8);
+            return strID;
+        }
+
+        // 与 DataCenter.GetHardwareFingerprint 一致
+        private static string GetHardwareFingerprint()
+        {
+            if (_cachedHardwareFingerprint != null) return _cachedHardwareFingerprint;
+
+            var parts = new List<string>();
+            try
+            {
+                if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+                {
+                    try
+                    {
+#pragma warning disable CA1416
+                        using var cryptoKey = Microsoft.Win32.Registry.LocalMachine
+                            .OpenSubKey(@"SOFTWARE\Microsoft\Cryptography");
+                        string machineGuid = cryptoKey?.GetValue("MachineGuid")?.ToString() ?? "";
+                        if (!string.IsNullOrEmpty(machineGuid)) parts.Add(machineGuid);
+
+                        using var cpuKey = Microsoft.Win32.Registry.LocalMachine
+                            .OpenSubKey(@"HARDWARE\DESCRIPTION\System\CentralProcessor\0");
+                        string cpuId = cpuKey?.GetValue("Identifier")?.ToString() ?? "";
+                        if (!string.IsNullOrEmpty(cpuId)) parts.Add(cpuId);
+#pragma warning restore CA1416
+                    }
+                    catch { }
+                }
+                else
+                {
+                    string machineId = TryReadFileLine("/etc/machine-id");
+                    if (string.IsNullOrWhiteSpace(machineId))
+                        machineId = TryReadFileLine("/var/lib/dbus/machine-id");
+                    if (!string.IsNullOrWhiteSpace(machineId)) parts.Add(machineId);
+
+                    try
+                    {
+                        if (File.Exists("/proc/cpuinfo"))
+                        {
+                            string cpuModel = File.ReadLines("/proc/cpuinfo")
+                                .FirstOrDefault(l => l.StartsWith("model name", StringComparison.OrdinalIgnoreCase))
+                                ?.Split(':').LastOrDefault()?.Trim() ?? "";
+                            if (!string.IsNullOrEmpty(cpuModel)) parts.Add(cpuModel);
+                        }
+                    }
+                    catch { }
+                }
+            }
+            catch { }
+
+            string combined = string.Join("|", parts.Where(p => !string.IsNullOrWhiteSpace(p)));
+            string fingerprint = string.IsNullOrEmpty(combined) ? "NOHW0000" : ComputeSha256Prefix(combined);
+            _cachedHardwareFingerprint = fingerprint;
+            return fingerprint;
+        }
+
+        // SHA256 前4字节 → 8位大写16进制
+        private static string ComputeSha256Prefix(string input)
+        {
+            using var sha256 = SHA256.Create();
+            byte[] hashBytes = sha256.ComputeHash(Encoding.UTF8.GetBytes(input));
+            return BitConverter.ToString(hashBytes, 0, 4).Replace("-", "").ToUpper();
+        }
+
+        // 读取文件第一个非空行
+        private static string TryReadFileLine(string path)
         {
             try
             {
-                var hardwareInfo = new HardwareInfo();
-                hardwareInfo.RefreshMotherboardList();
-
-                foreach (var motherboard in hardwareInfo.MotherboardList)
+                if (!File.Exists(path)) return null;
+                foreach (string line in File.ReadLines(path))
                 {
-                    if (!string.IsNullOrWhiteSpace(motherboard.SerialNumber))
-                    {
-                        return motherboard.SerialNumber.Trim();
-                    }
+                    string l = line.Trim();
+                    if (!string.IsNullOrEmpty(l)) return l;
                 }
             }
-            catch (Exception ex)
+            catch { }
+            return null;
+        }
+
+        // 判断 MAC 是否为本地管理地址（bit1=1），虚拟网卡多用此类型
+        private static bool IsLocallyAdministeredMac(string macHex)
+        {
+            if (macHex.Length < 2) return false;
+            if (!byte.TryParse(macHex.Substring(0, 2),
+                System.Globalization.NumberStyles.HexNumber, null, out byte firstByte))
+                return false;
+            return (firstByte & 0x02) != 0;
+        }
+
+        // 网卡类型优先级（与 DataCenter 一致）
+        private static int GetAdapterTypePriority(NetworkInterfaceType type)
+        {
+            switch (type)
             {
-                return string.Empty;
+                case NetworkInterfaceType.Ethernet: return 0;
+                case NetworkInterfaceType.GigabitEthernet: return 1;
+                case NetworkInterfaceType.FastEthernetT: return 2;
+                case NetworkInterfaceType.FastEthernetFx: return 3;
+                case NetworkInterfaceType.Wireless80211: return 4;
+                default: return 9;
             }
-            return string.Empty;
+        }
+
+        // 选取主网卡 MAC（与 DataCenter.EvalSB4Local 中网卡选取逻辑一致）
+        private static string GetPrimaryMacAddress()
+        {
+            string tempaddr = string.Empty;
+            string tempaddr1 = "unknow";
+
+            try
+            {
+                NetworkInterface[] adapters = NetworkInterface.GetAllNetworkInterfaces();
+
+                var sortedAdapters = adapters
+                    .Where(a => a.NetworkInterfaceType != NetworkInterfaceType.Loopback
+                             && a.NetworkInterfaceType != NetworkInterfaceType.Tunnel)
+                    .OrderBy(a => GetAdapterTypePriority(a.NetworkInterfaceType))
+                    .ThenBy(a => a.GetPhysicalAddress().ToString())
+                    .ToList();
+
+                foreach (NetworkInterface adapter in sortedAdapters)
+                {
+                    string addr = adapter.GetPhysicalAddress().ToString();
+                    if (addr.Length >= 6)
+                    {
+                        if (adapter.OperationalStatus == OperationalStatus.Up)
+                        {
+                            bool curIsGlobal = !IsLocallyAdministeredMac(addr);
+                            bool existingIsLocal = tempaddr != string.Empty && IsLocallyAdministeredMac(tempaddr);
+                            bool shouldReplace = tempaddr == string.Empty
+                                || (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows) && existingIsLocal && curIsGlobal);
+
+                            if (shouldReplace)
+                                tempaddr = addr;
+                        }
+                        tempaddr1 = addr;
+                    }
+                }
+
+                if (tempaddr == string.Empty)
+                    tempaddr = tempaddr1;
+            }
+            catch { }
+
+            return tempaddr ?? "unknow";
         }
     }
 }

@@ -27,7 +27,6 @@
   </ItemGroup>
 
 	<ItemGroup>
-		<PackageReference Include="Hardware.Info" Version="101.1.0.1" />
 		<PackageReference Include="Microsoft.Extensions.Hosting" Version="10.0.0" />
 		<PackageReference Include="Microsoft.Extensions.Hosting.Systemd" Version="10.0.0" />
 		<PackageReference Include="Swashbuckle.AspNetCore" Version="10.0.1" />
