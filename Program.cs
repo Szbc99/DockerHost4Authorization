@@ -15,6 +15,73 @@ namespace DockerHost
         // 键: clientId, 值: ConnectionId
         private static readonly ConcurrentDictionary<string, string> _activeClients = new ConcurrentDictionary<string, string>();
 
+        // 挑战-响应机制：防止客户端篡改后忽略断开事件继续运行
+        private static IHubContext<HardwareHub> _hubContext;
+        private static Timer _challengeTimer;
+        // nonce → (clientId, timestamp)
+        private static readonly ConcurrentDictionary<string, (string ClientId, DateTime Timestamp)> _pendingChallenges = new();
+
+        public HardwareHub(IHubContext<HardwareHub> hubContext)
+        {
+            if (_hubContext == null)
+            {
+                _hubContext = hubContext;
+                if (_challengeTimer == null)
+                {
+                    _challengeTimer = new Timer(OnChallengeTimer, null,
+                        TimeSpan.FromSeconds(30), TimeSpan.FromSeconds(30));
+                }
+            }
+        }
+
+        // 定期向所有活跃客户端发送挑战，验证其仍持有硬件注册码
+        private static async void OnChallengeTimer(object state)
+        {
+            try
+            {
+                var hardwareId = HardwareInfoGenerator.GenerateHardwareInfo();
+                var now = DateTime.UtcNow;
+
+                // 检查超时未响应的挑战
+                var expiredNonces = new List<string>();
+                foreach (var kvp in _pendingChallenges)
+                {
+                    if ((now - kvp.Value.Timestamp).TotalSeconds > 10)
+                    {
+                        expiredNonces.Add(kvp.Key);
+                        if (_activeClients.TryGetValue(kvp.Value.ClientId, out var connId))
+                        {
+                            try
+                            {
+                                await _hubContext.Clients.Client(connId).SendAsync("ForceDisconnect", "挑战响应超时");
+                            }
+                            catch { }
+                            _activeClients.TryRemove(new KeyValuePair<string, string>(kvp.Value.ClientId, connId));
+                            Console.WriteLine($"[挑战] 客户端 {kvp.Value.ClientId} 响应超时，已断开");
+                        }
+                    }
+                }
+                foreach (var n in expiredNonces)
+                    _pendingChallenges.TryRemove(n, out _);
+
+                // 向所有活跃客户端发送新挑战
+                foreach (var kvp in _activeClients)
+                {
+                    var nonce = Guid.NewGuid().ToString("N");
+                    _pendingChallenges[nonce] = (kvp.Key, now);
+                    try
+                    {
+                        await _hubContext.Clients.Client(kvp.Value).SendAsync("Challenge", nonce);
+                    }
+                    catch { }
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[挑战] 定时器异常: {ex.Message}");
+            }
+        }
+
         // 当有新客户端连接时，此方法被调用
         public override Task OnConnectedAsync()
         {
@@ -27,7 +94,7 @@ namespace DockerHost
             // 4. 服务端与客户端连接中断的时候，要及时清理掉_activeClients中对应的连接ID
             // 查找当前断开连接对应的 clientId
             var disconnectedClient = _activeClients.FirstOrDefault(kvp => kvp.Value == Context.ConnectionId);
-            
+
             if (!string.IsNullOrEmpty(disconnectedClient.Key))
             {
                 // 只有当字典中存储的 ConnectionId 与当前断开的 ConnectionId 一致时才移除
@@ -37,6 +104,18 @@ namespace DockerHost
                     Console.WriteLine($"客户端断开连接，已清理 ID: {disconnectedClient.Key}");
                 }
             }
+
+            // 清理该客户端的所有待处理挑战
+            var clientId = disconnectedClient.Key;
+            if (!string.IsNullOrEmpty(clientId))
+            {
+                foreach (var kvp in _pendingChallenges)
+                {
+                    if (kvp.Value.ClientId == clientId)
+                        _pendingChallenges.TryRemove(kvp.Key, out _);
+                }
+            }
+
             return base.OnDisconnectedAsync(exception);
         }
 
@@ -79,6 +158,39 @@ namespace DockerHost
             
             // 3. 将加密后的结果发送回调用方
             await Clients.Caller.SendAsync("ReceiveEncryptedHardwareId", encryptedId);
+        }
+
+        // 客户端回应挑战：用硬件注册码对 nonce 做 HMAC-SHA256 签名
+        public async Task ChallengeResponse(string clientId, string nonce, string response)
+        {
+            if (_pendingChallenges.TryRemove(nonce, out var pending))
+            {
+                if (pending.ClientId != clientId)
+                {
+                    await Clients.Caller.SendAsync("ForceDisconnect", "挑战验证失败");
+                    Context.Abort();
+                    return;
+                }
+
+                var hardwareId = HardwareInfoGenerator.GenerateHardwareInfo();
+                var expectedResponse = ComputeHmac(hardwareId, nonce);
+
+                if (!string.Equals(expectedResponse, response, StringComparison.OrdinalIgnoreCase))
+                {
+                    Console.WriteLine($"[挑战] 客户端 {clientId} 响应验证失败");
+                    await Clients.Caller.SendAsync("ForceDisconnect", "挑战验证失败");
+                    Context.Abort();
+                    _activeClients.TryRemove(new KeyValuePair<string, string>(clientId, Context.ConnectionId));
+                }
+            }
+        }
+
+        private static string ComputeHmac(string key, string message)
+        {
+            byte[] hash = HMACSHA256.HashData(
+                Encoding.UTF8.GetBytes(key),
+                Encoding.UTF8.GetBytes(message));
+            return Convert.ToHexString(hash);
         }
     }
 
@@ -163,9 +275,16 @@ namespace DockerHost
                     {
                         if (System.Net.IPAddress.TryParse(ipString, out var ipAddress))
                         {
-                            serverOptions.Listen(ipAddress, port);
-                            Console.WriteLine($"[Linux环境] 监听 Docker 网桥 {ipString}:{port}");
-                            bound = true;
+                            try
+                            {
+                                serverOptions.Listen(ipAddress, port);
+                                Console.WriteLine($"[Linux环境] 监听 Docker 网桥 {ipString}:{port}");
+                                bound = true;
+                            }
+                            catch (Exception ex)
+                            {
+                                Console.WriteLine($"[Linux环境] 无法绑定 {ipString}:{port} — {ex.Message}");
+                            }
                         }
                     }
 
@@ -184,8 +303,9 @@ namespace DockerHost
                 }
             });
 
-            // 添加对 Systemd 的支持
+            // 添加对 Systemd / Windows Service 的支持（各自在对应平台上生效，非目标平台为 no-op）
             builder.Host.UseSystemd();
+            builder.Host.UseWindowsService();
 
             // 配置服务
             builder.Services.AddControllers();
