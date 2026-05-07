@@ -2,6 +2,7 @@
 using System.Collections.Concurrent;
 using System.Net.NetworkInformation;
 using System.Net.Sockets;
+using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text;
@@ -120,6 +121,7 @@ namespace DockerHost
         }
 
         // 客户端调用此方法以获取加密的硬件ID
+        [Obfuscation(Feature = "virtualization", Exclude = false)]
         public async Task GetEncryptedHardwareId(string clientId, int salt)
         {
             var currentConnectionId = Context.ConnectionId;
@@ -161,6 +163,7 @@ namespace DockerHost
         }
 
         // 客户端回应挑战：用硬件注册码对 nonce 做 HMAC-SHA256 签名
+        [Obfuscation(Feature = "virtualization", Exclude = false)]
         public async Task ChallengeResponse(string clientId, string nonce, string response)
         {
             if (_pendingChallenges.TryRemove(nonce, out var pending))
@@ -185,6 +188,7 @@ namespace DockerHost
             }
         }
 
+        [Obfuscation(Feature = "virtualization", Exclude = false)]
         private static string ComputeHmac(string key, string message)
         {
             byte[] hash = HMACSHA256.HashData(
@@ -381,6 +385,7 @@ namespace DockerHost
     // 新增：用于对称加密的帮助类
     public static class EncryptionHelper
     {
+        [Obfuscation(Feature = "virtualization", Exclude = false)]
         public static string EncryptString(string plainText, string password, int salt)
         {
             byte[] saltBytes = BitConverter.GetBytes(salt);
@@ -423,6 +428,7 @@ namespace DockerHost
     {
         private static string _cachedHardwareFingerprint = null;
 
+        [Obfuscation(Feature = "virtualization", Exclude = false)]
         public static string GenerateHardwareInfo()
         {
             string macAddr = GetPrimaryMacAddress();
@@ -457,6 +463,7 @@ namespace DockerHost
         }
 
         // 与 DataCenter.GetHardwareFingerprint 一致
+        [Obfuscation(Feature = "virtualization", Exclude = false)]
         private static string GetHardwareFingerprint()
         {
             if (_cachedHardwareFingerprint != null) return _cachedHardwareFingerprint;
