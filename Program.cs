@@ -19,6 +19,7 @@ namespace DockerHost
         // 挑战-响应机制：防止客户端篡改后忽略断开事件继续运行
         private static IHubContext<HardwareHub> _hubContext;
         private static Timer _challengeTimer;
+        private static DateTime _lastChallengeTime = DateTime.MinValue;
         // nonce → (clientId, timestamp)
         private static readonly ConcurrentDictionary<string, (string ClientId, DateTime Timestamp)> _pendingChallenges = new();
 
@@ -30,7 +31,7 @@ namespace DockerHost
                 if (_challengeTimer == null)
                 {
                     _challengeTimer = new Timer(OnChallengeTimer, null,
-                        TimeSpan.FromSeconds(30), TimeSpan.FromSeconds(30));
+                        TimeSpan.FromSeconds(15), TimeSpan.FromSeconds(15));
                 }
             }
         }
@@ -47,7 +48,7 @@ namespace DockerHost
                 var expiredNonces = new List<string>();
                 foreach (var kvp in _pendingChallenges)
                 {
-                    if ((now - kvp.Value.Timestamp).TotalSeconds > 10)
+                    if ((now - kvp.Value.Timestamp).TotalSeconds > 30)
                     {
                         expiredNonces.Add(kvp.Key);
                         if (_activeClients.TryGetValue(kvp.Value.ClientId, out var connId))
@@ -65,16 +66,23 @@ namespace DockerHost
                 foreach (var n in expiredNonces)
                     _pendingChallenges.TryRemove(n, out _);
 
-                // 向所有活跃客户端发送新挑战
-                foreach (var kvp in _activeClients)
+                // 每300秒向所有活跃客户端发送新挑战
+                if ((now - _lastChallengeTime).TotalSeconds >= 300)
                 {
-                    var nonce = Guid.NewGuid().ToString("N");
-                    _pendingChallenges[nonce] = (kvp.Key, now);
-                    try
+                    _lastChallengeTime = now;
+                    foreach (var kvp in _activeClients)
                     {
-                        await _hubContext.Clients.Client(kvp.Value).SendAsync("Challenge", nonce);
+                        // 跳过已有待处理挑战的客户端，避免重复
+                        if (_pendingChallenges.Values.Any(v => v.ClientId == kvp.Key))
+                            continue;
+                        var nonce = Guid.NewGuid().ToString("N");
+                        _pendingChallenges[nonce] = (kvp.Key, now);
+                        try
+                        {
+                            await _hubContext.Clients.Client(kvp.Value).SendAsync("Challenge", nonce);
+                        }
+                        catch { }
                     }
-                    catch { }
                 }
             }
             catch (Exception ex)
