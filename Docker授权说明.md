@@ -933,6 +933,191 @@ K8s 环境下 `/var/tmp` 通过 hostPath 挂载到宿主机，凭证锁文件存
 - **Pod 重启**：旧 Pod 终止 → 内核回收文件句柄 → 锁释放 → 新 Pod 正常获取锁。
 - **节点漂移**：Pod 被调度到新节点 → 不同节点的 `/var/tmp` 是隔离的 → 锁文件不存在 → 正常获取锁。
 
+### 6.9 物理机直接绑定（替代方案）
+
+当需要将授权绑定到物理机硬件（而非虚拟机）时，可将服务端直接部署在物理机操作系统上，K8s 集群内的客户端通过物理机的固定 IP 跨 VM 边界直连服务端。
+
+#### 6.9.1 网络架构
+
+```
++--------------------------------------------------------------------+
+| 物理机 (Bare Metal / VM Host)                                       |
+|                                                                     |
+|  DockerHost4Authorization (服务端)                                   |
+|  ├─ 监听物理网卡 IP :5000                                           |
+|  ├─ 凭证锁 /var/tmp/gw-auth-{MD5}.lock                              |
+|  └─ 采集物理机硬件指纹 (真实 MAC / machine-id / CPU)                  |
+|                                                                     |
++----------------------------------+----------------------------------+
+                                   |
+                                   | TCP :5000 (物理机固定 IP)
+                                   |
++----------------------------------+----------------------------------+
+| 虚拟机 (K8s Node)                                                    |
+|                                                                     |
+|  +---------------------------------------------------+              |
+|  | Deployment: client-app                             |              |
+|  |  env: DOCKER_HOST_IP = 192.168.x.x (物理机固定 IP)  |              |
+|  |  连接 $(DOCKER_HOST_IP):5000                        |              |
+|  +---------------------------------------------------+              |
++--------------------------------------------------------------------+
+```
+
+客户端 Pod 跨过 VM 边界，直接访问物理机上的服务端。授权绑定的硬件指纹来自物理机，而非虚拟机。
+
+#### 6.9.2 与 DaemonSet 方案的对比
+
+| 维度 | DaemonSet（K8s Node 级） | 物理机直接绑定 |
+|---|---|---|
+| 服务端运行位置 | K8s Node Pod（虚拟机内） | 物理机操作系统 |
+| 硬件指纹来源 | 虚拟机（/etc/machine-id、虚拟 CPU） | 物理机（真实硬件） |
+| 客户端连接方式 | `status.hostIP`（VM IP）+ hostPort | 物理机固定 IP |
+| 网络路径 | 同节点 Pod 间直连 | 跨 VM 边界 |
+| 单点故障 | 每节点独立服务端 | 物理机故障影响所有客户端 |
+| 调度约束 | podAffinity 对齐 DaemonSet | 无特殊调度要求 |
+| 适用场景 | K8s 全托管、硬件无关授权 | 必须绑定物理硬件、物理机稳定在线 |
+
+#### 6.9.3 物理机服务端部署
+
+服务端部署方式与第 5 节一致（systemd 或 Windows Service）。物理机服务端不再需要 DaemonSet、hostPath 挂载等 K8s 抽象。
+
+关键区别：服务端需监听物理网卡 IP 而非 Docker 网桥地址。配置方式取决于操作系统：
+
+**Linux（物理机）**：
+
+```json
+{
+  "Communication": {
+    "DockerBridgeIps": [],
+    "TcpPort": 5000,
+    "IpAddress": "192.168.1.100"
+  }
+}
+```
+
+> `DockerBridgeIps` 置空后 Linux 回退到 `127.0.0.1`。通过 `IpAddress` 显式指定物理网卡 IP 使其监听在物理接口上。若需同时监听多个 IP，可借助 iptables DNAT 将物理 IP 流量转发到 `127.0.0.1:5000`。
+
+**Windows（物理机）**：
+
+```json
+{
+  "Communication": {
+    "TcpPort": 5000,
+    "IpAddress": "0.0.0.0"
+  }
+}
+```
+
+> `IpAddress` 设为 `0.0.0.0` 或 `*` 时监听所有可用 IP，物理机和本机均可访问。
+
+#### 6.9.4 客户端 Deployment（物理机绑定模式）
+
+与 DaemonSet 模式的核心差异：
+- 删除 `valueFrom.fieldRef.fieldPath: status.hostIP`，替换为物理机固定 IP
+- 删除 `podAffinity`（不与 DaemonSet 对齐调度）
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: client-app
+  namespace: gw-auth
+  labels:
+    app: client-app
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: client-app
+  template:
+    metadata:
+      labels:
+        app: client-app
+    spec:
+      containers:
+      - name: client
+        image: your-registry/gwdatacenter:latest
+        imagePullPolicy: IfNotPresent
+
+        env:
+        # ---------- 关键：物理机固定 IP ----------
+        # 替换 status.hostIP 为物理机真实 IP
+        - name: DOCKER_HOST_IP
+          value: "192.168.1.100"
+        - name: DOCKER_HOST_PORT
+          value: "5000"
+
+        volumeMounts:
+        - name: license-config
+          mountPath: /app/data/AlarmCenter
+          readOnly: true
+
+        resources:
+          requests:
+            cpu: 100m
+            memory: 256Mi
+          limits:
+            cpu: "2"
+            memory: 2Gi
+
+      volumes:
+      - name: license-config
+        configMap:
+          name: client-license-config
+```
+
+#### 6.9.5 客户端 ConfigMap（物理机绑定模式）
+
+`DockerHostIP` 直接填入物理机固定 IP（或在启动脚本中将 `DOCKER_HOST_IP` 环境变量回写到此值）：
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: client-license-config
+  namespace: gw-auth
+data:
+  AlarmCenterProperties.xml: |
+    <?xml version="1.0" encoding="utf-8"?>
+    <root>
+      <Properties name="HostServer">
+        <DockerHostIP value="192.168.1.100" />
+        <!-- 直接填入物理机固定 IP，不再留空或使用 status.hostIP -->
+        <DockerHostPort value="5000" />
+      </Properties>
+    </root>
+
+  YourLicense.xml: |
+    <?xml version="1.0" encoding="utf-8"?>
+    <root>
+      <guid>xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx</guid>
+      <shibie>XXXX-XXXX-XXXX-XXXX-XXXX</shibie>
+      <mode>4</mode>
+      <limitdate>2099-12-31</limitdate>
+      <supporttemper>false</supporttemper>
+      <softname>YourProductName</softname>
+    </root>
+```
+
+#### 6.9.6 网络与安全考量
+
+| 考量项 | 说明 |
+|---|---|
+| 网络可达性 | K8s Pod CIDR 必须能路由到物理机 IP，确保 VPC/子网/防火墙放行 Pod 网段 → 物理机 `:5000` |
+| 物理机 IP 固定 | 使用静态 IP 或 DHCP 预留，IP 变更会导致所有客户端连接中断 |
+| 物理机单点故障 | 物理机宕机 → 所有客户端授权中断（可配合 `<supporttemper>true</supporttemper>` 临时授权兜底） |
+| 防火墙 | 物理机 `:5000` 仅允许 K8s Pod CIDR，拒绝外部来源 |
+| 明文流量 | 跨物理网络的 TCP 明文流量存在被嗅探风险，生产环境建议后续补充 TLS |
+
+#### 6.9.7 从 DaemonSet 迁移步骤
+
+1. 在物理机上按第 5 节方式部署服务端（systemd / Windows Service）
+2. 确认物理机 IP 能从 K8s Pod 网络路由通
+3. 修改客户端 Deployment：将 `valueFrom.fieldRef.fieldPath: status.hostIP` 替换为物理机固定 IP
+4. 修改 ConfigMap：将 `DockerHostIP` 更新为物理机 IP
+5. 删除不再需要的 DaemonSet 和 hostPath 卷
+6. 重新部署客户端 Deployment
+
 ---
 
 ## 7. 授权失败处理
