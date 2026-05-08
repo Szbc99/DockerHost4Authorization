@@ -158,6 +158,10 @@ namespace DockerHost
                         return;
                     }
                 }
+                else
+                {
+                    Console.WriteLine($"客户端已连接 ID: {clientId}");
+                }
             }
 
             // 1. 获取硬件ID（作为明文）

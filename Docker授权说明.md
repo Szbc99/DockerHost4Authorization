@@ -204,41 +204,131 @@ options.KeepAliveInterval = TimeSpan.FromSeconds(5);
 
 ### 3.1 授权启动流程
 
+客户端在 `StationItem.init()` 初始化阶段调用 `DataCenter.EvalSB4Docker(null)`，该公开方法读取授权 XML 中的 `<mode>` 节点，仅当 `mode=4` 时才进入 Docker 授权分支。
+
 ```
 StationItem.init()
-  └─ DataCenter.EvalSB4Docker(null)
-       └─ EvalSB4Docker()                         [私有方法]
-            ├─ _ = ConnectDockerHost()             [fire-and-forget，建立 SignalR 连接]
+  └─ DataCenter.EvalSB4Docker(null)               [公开方法，检查 mode=4]
+       ├─ 读取 <mode>：仅当 mode=4 时继续
+       ├─ 检查 <limitdate>：是否超过有效期
+       └─ EvalSB4Docker()                         [私有方法，核心授权逻辑]
+            ├─ _ = ConnectDockerHost()             [fire-and-forget，建立 SignalR 长连接]
             ├─ dockerSmbReceived.Task.Wait(5s)     [阻塞等待，最多 5 秒]
-            └─ CheckSMB(strSMB4Docker)             [验证解密后的注册码]
-                 ├─ 通过 → 正常运行
-                 └─ 不通过 → 转为临时授权模式 (bTemper4QX=true)
+            │    ├─ 收到 → strSMB4Docker 被赋值
+            │    └─ 超时 → strSMB4Docker = "超时未获取"
+            └─ CheckSMB(strSMB4Docker)             [验证解密后的注册码是否在 <shibie> 列表中]
+                 ├─ 通过 → bSiBOK=true → 正常运行
+                 └─ 不通过 → bTemper4QX=true → 临时授权模式，运行一段时间后自动退出
 ```
+
+**关键变量**：
+
+| 变量 | 类型 | 说明 |
+|---|---|---|
+| `strSMB4Docker` | `static string` | 缓存解密后的 Docker 注册码，初始值 `"未获取"` |
+| `bStartDocker` | `static bool` | 防止重复启动 SignalR 连接，整个进程生命周期仅启动一次 |
+| `iSalt4Docker` | `static int` | AES 加密盐值，首次使用时随机生成 100000~999999，进程内不变 |
+| `dockerSmbReceived` | `TaskCompletionSource<bool>` | 用于 `EvalSB4Docker` 阻塞等待 `ConnectDockerHost` 异步结果的信号量 |
+| `connectionBuilder` | `static HubConnectionBuilder` | SignalR 连接构造器，缓存复用，避免重复创建 |
 
 ### 3.2 连接配置
 
-配置来源于 `AlarmCenterProperties.xml` 的 `<HostServer>` 节点：
+#### 3.2.1 配置文件位置
 
-| 配置项 | 默认值 | 说明 |
+客户端配置通过 `PropertyService` 从 XML 文件读取，文件路径为：
+
+```
+{应用程序根目录}/data/AlarmCenter/AlarmCenterProperties.xml
+```
+
+`GetPropertyFromPropertyService("HostServer", "DockerHostPort", "5000")` 方法在 XML 中查找 `<Properties name="HostServer">` 节点，读取子节点值，找不到时返回传入的默认值。
+
+#### 3.2.2 配置项
+
+| 配置项 | XML 路径 | 默认值 | 说明 |
+|---|---|---|---|
+| `DockerHostIP` | `HostServer.DockerHostIP` | `host.docker.internal` | 服务端地址 |
+| `DockerHostPort` | `HostServer.DockerHostPort` | `5000` | 服务端 TCP 端口 |
+
+#### 3.2.3 IP 地址回退逻辑
+
+```csharp
+if (string.IsNullOrWhiteSpace(dockerHostIP) || dockerHostIP == "*" || dockerHostIP == "0.0.0.0")
+    dockerHostIP = "host.docker.internal";
+```
+
+| 配置值 | 行为 |
+|---|---|
+| 正常 IP（如 `172.17.0.1`） | 直接使用 |
+| 空字符串 / `*` / `0.0.0.0` | 回退到 `host.docker.internal` |
+| `host.docker.internal` | Docker 桌面版自动解析为宿主机网关；Linux 下需 `--add-host` 注入 |
+
+#### 3.2.4 clientId 与盐值
+
+| 参数 | 来源 | 说明 |
 |---|---|---|
-| `DockerHostIP` | `host.docker.internal` | 服务端地址，自动解析为所在容器的 Docker 网关 |
-| `DockerHostPort` | `5000` | 服务端端口 |
+| `clientId` | 授权 XML 的 `<guid>` 节点 | 全局唯一标识，同时作为 AES 加密的 password；服务端用其做防多开 key |
+| `iSalt4Docker` | `new Random().Next(100000, 999999)` | AES 加密盐值，首次使用时随机生成，进程生命周期内不变 |
 
 ### 3.3 连接方式
 
-统一使用 TCP，URL 格式 `http://{DockerHostIP}:{DockerHostPort}/hardwarehub`。
+统一使用 TCP + SignalR (WebSocket)，URL 格式：
 
-`host.docker.internal` 通过容器启动参数 `--add-host host.docker.internal:host-gateway` 注入，`host-gateway`（Docker 20.10+）自动解析为当前容器网络的宿主机侧网关地址。
+```
+http://{DockerHostIP}:{DockerHostPort}/hardwarehub
+```
+
+示例：
+- Docker Desktop（Windows/Mac）：`http://host.docker.internal:5000/hardwarehub`
+- Linux Docker（手动指定网桥）：`http://172.17.0.1:5000/hardwarehub`
+- K8s（通过 status.hostIP）：`http://10.0.0.15:5000/hardwarehub`
+
+`host.docker.internal` 在 Docker Desktop 中自动可用。Linux 下需容器启动参数 `--add-host host.docker.internal:host-gateway`（Docker 20.10+ 支持 `host-gateway`）。
+
+**连接生命周期**：
+
+- `connectionBuilder` 是 `static` 变量，首次连接时创建并配置 `WithAutomaticReconnect()`，后续调用复用同一构造器
+- `bStartDocker` 标志确保 `StartAsync()` 在整个进程生命周期仅调用一次
+- 连接建立后保持 WebSocket 长连接，不主动断开
 
 ### 3.4 SignalR 事件处理
 
-| 事件 | 行为 |
-|---|---|
-| `ReceiveEncryptedHardwareId` | AES 解密授权码 → 赋值 `strSMB4Docker` → `dockerSmbReceived.TrySetResult(true)` |
-| `ClientAlreadyConnected` | 同 GUID 已有活跃连接 → `Environment.Exit(1)` |
-| `Closed` | 连接永久关闭（重试耗尽）→ `Environment.Exit(1)` |
-| `Reconnecting` | 记录警告日志 |
-| `Reconnected` | 记录恢复日志，**重新调用 `GetEncryptedHardwareId` 恢复防多开保护** |
+| 事件 | 方向 | 行为 |
+|---|---|---|
+| `ReceiveEncryptedHardwareId` | 服务端→客户端 | AES 解密授权码 → 赋值 `strSMB4Docker` → `dockerSmbReceived.TrySetResult(true)` |
+| `ClientAlreadyConnected` | 服务端→客户端 | 同 GUID 已有活跃连接 → `StopAsync()` → `Environment.Exit(1)` |
+| `Closed` | SignalR 内置 | 连接永久关闭（重试耗尽或服务端主动断开）→ 三个混淆的 `Environment.Exit(1)` 方法之一被调用 |
+| `Reconnecting` | SignalR 内置 | 记录警告日志，输出错误原因 |
+| `Reconnected` | SignalR 内置 | 记录恢复日志，**重新调用 `GetEncryptedHardwareId(clientId, iSalt4Docker)` 恢复防多开保护** |
+| `Challenge` | 服务端→客户端 | 收到 nonce → HMAC-SHA256(注册码, nonce) → 调用 `ChallengeResponse` 回应 |
+| `ForceDisconnect` | 服务端→客户端 | 挑战超时或验证失败 → `Environment.Exit(1)` |
+
+#### 3.4.1 挑战-响应处理细节
+
+客户端收到 `Challenge(nonce)` 后的处理逻辑：
+
+```csharp
+connection.On<string>("Challenge", async (nonce) =>
+{
+    // 注册码未就绪时忽略挑战（避免误判）
+    if (string.IsNullOrEmpty(strSMB4Docker) || strSMB4Docker == "未获取" || strSMB4Docker == "超时未获取")
+        return;
+
+    // HMAC-SHA256 签名
+    byte[] hash = HMACSHA256.HashData(
+        Encoding.UTF8.GetBytes(strSMB4Docker),
+        Encoding.UTF8.GetBytes(nonce));
+    string response = Convert.ToHexString(hash);
+
+    // 回应服务端
+    await connection.InvokeAsync("ChallengeResponse", clientId, nonce, response);
+});
+```
+
+**关键点**：
+- 仅当 `strSMB4Docker` 已成功获取（非空、非"未获取"、非"超时未获取"）时才响应
+- 使用 `System.Security.Cryptography.HMACSHA256.HashData`（静态方法，无需实例化）
+- 响应格式为大写十六进制字符串（`Convert.ToHexString`）
 
 ### 3.5 自动重连
 
@@ -246,13 +336,135 @@ StationItem.init()
 connectionBuilder.WithAutomaticReconnect();
 ```
 
-SignalR 默认重连策略（0s → 2s → 10s → 30s，4 次后触发 `Closed`）。
+SignalR 默认重连策略（0s → 2s → 10s → 30s，共 4 次尝试，全部失败后触发 `Closed`）。
 
-重连成功后 `Reconnected` 回调重新调用 `GetEncryptedHardwareId`，向服务端注册新的 `ConnectionId`，确保防多开保护在重连后不丢失。
+重连成功后 `Reconnected` 回调执行：
+```csharp
+await connection.InvokeAsync("GetEncryptedHardwareId", clientId, iSalt4Docker);
+```
+向服务端重新注册 `clientId → 新ConnectionId` 映射，确保防多开保护在重连后不丢失。注意重连时 salt 不变（`iSalt4Docker` 已缓存），服务端用相同 salt 重新加密。
 
 ### 3.6 解密算法
 
-`DockerDecryptString(cipherText, password, salt)` — 与服务端 `EncryptionHelper.EncryptString` 完全对称，AES-256-CBC + PBKDF2（SHA-256, 10000 迭代）。
+客户端解密方法：`MD5DES.DockerDecryptString(string cipherText, string password, int salt)`
+
+位置：`GWDataCenter/加解密/MD5DES.cs:295`
+
+与服务端 `EncryptionHelper.EncryptString` 完全对称：
+
+| 参数 | 值 |
+|---|---|
+| 算法 | AES-256-CBC |
+| 密钥派生 | PBKDF2 (Rfc2898DeriveBytes.Pbkdf2) |
+| Hash 算法 | SHA-256 |
+| 迭代次数 | 10,000 |
+| 密钥长度 | 256 bit（32 字节） |
+| IV 长度 | 128 bit（16 字节） |
+| 密文编码 | Base64 |
+
+密钥和 IV 由同一 password + salt 分别派生：
+```csharp
+byte[] key = Rfc2898DeriveBytes.Pbkdf2(password, saltBytes, 10000, SHA256, 32);
+byte[] iv  = Rfc2898DeriveBytes.Pbkdf2(password, saltBytes, 10000, SHA256, 16);
+```
+
+### 3.7 防篡改保护机制
+
+为防止攻击者反编译后禁用 `Environment.Exit` 绕过授权，客户端使用了多层冗余退出保护：
+
+#### 3.7.1 三个混淆的退出方法
+
+| 方法 | 触发场景 | 签名特征 |
+|---|---|---|
+| `FlushTelemetryBuffer(int code)` | `ClientAlreadyConnected`、`ForceDisconnect` | 参数为 `int` |
+| `ResetConnectionPool(string tag)` | `Closed` 含错误信息 | 参数为 `string`，附带销毁 `strSMB4Docker` 副作用 |
+| `CollectGcStats(long timestamp)` | `Closed` 无错误 | 参数为 `long`（时间戳） |
+
+**设计意图**：
+- Eazfuscator 混淆后方法名变为无意义符号（如 `a.b` / `c.d` / `e.f`）
+- 三个方法签名各不相同，防止按 `call` 指令模式批量搜索
+- 全部标记 `[Obfuscation(Feature = "virtualization")]`，方法体被虚拟化，反编译后不可读
+- 攻击者必须全部找到并禁用三个方法才能阻止退出
+
+#### 3.7.2 关键代码保护
+
+所有授权相关方法均使用 `[Obfuscation(Feature = "virtualization", Exclude = false)]` 标记，包括：
+- `EvalSB4Docker` / `EvalSB4Docker(object o)`
+- `ConnectDockerHost`
+- `GetSbm` / `GetSbmV2` / `GetHardwareFingerprint`
+- `CheckSMB` / `GetSBMList`
+- `DockerDecryptString`（在 MD5DES.cs 中）
+- `GetLicenseRunType`
+
+#### 3.7.3 进程退出触发点汇总
+
+| 触发条件 | 退出方式 | 位置 |
+|---|---|---|
+| 同 GUID 重复连接 | `FlushTelemetryBuffer(1)` | `ClientAlreadyConnected` 回调 |
+| 服务端要求断开（挑战失败/超时） | `FlushTelemetryBuffer(0xE001)` | `ForceDisconnect` 回调 |
+| 连接关闭（含异常） | `ResetConnectionPool(error.Message)` | `Closed` 事件 |
+| 连接关闭（正常） | `CollectGcStats(DateTime.UtcNow.Ticks)` | `Closed` 事件 |
+
+### 3.8 客户端 Docker 授权配置清单
+
+要使客户端以 Docker 授权模式运行，需完成以下配置：
+
+#### 3.8.1 授权 XML 文件
+
+位置：`{应用程序根目录}/data/AlarmCenter/AlarmCenterProperties.xml` 同目录下的授权文件（通常为 `*.xml`，由 `StationItem.XMLDoc` 加载）。
+
+必要节点：
+
+```xml
+<root>
+  <guid>xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx</guid>
+  <!-- 全局唯一标识，同时作为 AES 加密的 password -->
+  <shibie>XXXX-XXXX-XXXX-XXXX-XXXX</shibie>
+  <!-- 授权的注册码（5段V2格式），用于 CheckSMB() 验证 -->
+  <mode>4</mode>
+  <!-- 授权模式：1=本地 2=云端 3=仅时间 4=容器部署 -->
+  <limitdate>2099-12-31</limitdate>
+  <!-- 授权有效期截止日期 -->
+  <supporttemper>false</supporttemper>
+  <!-- 是否支持临时授权（授权失败时的兜底策略） -->
+</root>
+```
+
+> **注意**：`<shibie>` 支持多个备选注册码，节点名依次为 `<shibie>`、`<shibie2>`、`<shibie3>` ... `<shibie6>`，`CheckSMB()` 会逐一匹配。
+
+#### 3.8.2 属性配置文件
+
+`AlarmCenterProperties.xml` 中的 `HostServer` 节点：
+
+```xml
+<Properties name="HostServer">
+    <DockerHostIP value="" />
+    <!-- 留空或设为 * / 0.0.0.0 时自动回退到 host.docker.internal -->
+    <DockerHostPort value="5000" />
+    <!-- 服务端端口，需与服务端 TcpPort 一致 -->
+</Properties>
+```
+
+#### 3.8.3 环境变量（K8s 场景替代方案）
+
+当使用 Kubernetes 部署时，`DockerHostIP` 可通过环境变量 `DOCKER_HOST_IP` 注入，客户端启动脚本或代码需额外支持从环境变量读取。当前代码优先读取 `PropertyService`，若需支持环境变量需改造 `ConnectDockerHost` 中的读取逻辑。
+
+#### 3.8.4 容器启动参数
+
+```bash
+# Docker 桌面版（Windows/Mac）—— host.docker.internal 自动可用
+docker run -d your-client-image
+
+# Linux Docker —— 需显式注入 host-gateway
+docker run -d \
+  --add-host host.docker.internal:host-gateway \
+  your-client-image
+
+# 或直接指定网桥 IP
+docker run -d \
+  -e DockerHostIP=172.17.0.1 \
+  your-client-image
+```
 
 ---
 
@@ -637,6 +849,8 @@ spec:
 
 ### 6.5 客户端 ConfigMap（授权配置文件）
 
+需要两个配置文件注入到 `/app/data/AlarmCenter/`：
+
 ```yaml
 apiVersion: v1
 kind: ConfigMap
@@ -644,18 +858,34 @@ metadata:
   name: client-license-config
   namespace: gw-auth
 data:
+  # ① 网络连接配置
   AlarmCenterProperties.xml: |
     <?xml version="1.0" encoding="utf-8"?>
     <root>
       <Properties name="HostServer">
         <DockerHostIP value="" />
-        <!-- 留空时客户端自动读取 DOCKER_HOST_IP 环境变量 -->
+        <!-- 留空时自动回退到 host.docker.internal -->
+        <!-- K8s 下若需走宿主机 IP，通过启动脚本将 DOCKER_HOST_IP 写入此值 -->
         <DockerHostPort value="5000" />
       </Properties>
     </root>
+
+  # ② 授权许可文件（文件名与 StationItem 加载的文件名一致）
+  YourLicense.xml: |
+    <?xml version="1.0" encoding="utf-8"?>
+    <root>
+      <guid>xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx</guid>
+      <shibie>XXXX-XXXX-XXXX-XXXX-XXXX</shibie>
+      <mode>4</mode>
+      <limitdate>2099-12-31</limitdate>
+      <supporttemper>false</supporttemper>
+      <softname>YourProductName</softname>
+    </root>
 ```
 
-> 客户端代码需支持：`DockerHostIP` 为空时读取环境变量 `DOCKER_HOST_IP`。或者直接将 ConfigMap 中的值设为 `${DOCKER_HOST_IP}` 并在启动脚本中做环境变量替换。
+> **K8s 环境下的 IP 配置**：当前客户端代码优先从 `AlarmCenterProperties.xml` 读取 `DockerHostIP`。K8s 下若需使用 `status.hostIP`，有两种方案：
+> 1. 在容器启动脚本中将 `DOCKER_HOST_IP` 环境变量写入 Properties 文件
+> 2. 修改 `ConnectDockerHost` 方法增加环境变量回退逻辑
 
 ### 6.6 NetworkPolicy（可选加固）
 
@@ -707,16 +937,35 @@ K8s 环境下 `/var/tmp` 通过 hostPath 挂载到宿主机，凭证锁文件存
 
 ## 7. 授权失败处理
 
+### 7.1 客户端侧
+
+| 场景 | 行为 | 退出方式 |
+|---|---|---|
+| 5 秒内未收到加密授权码 | 超时，`strSMB4Docker = "超时未获取"`，进入临时授权模式 | 不退出，`bTemper4QX=true` |
+| AES 解密失败 | 记录错误日志，`TrySetResult(false)` | 不退出，`bTemper4QX=true` |
+| `CheckSMB()` 验证不通过 | 转为临时授权模式（`bTemper4QX=true`），运行一段时间后自动退出 | 定时器触发退出 |
+| 同 GUID 重复连接 | `StopAsync()` → `FlushTelemetryBuffer(1)` → 退出 | `Environment.Exit(1)` |
+| 连接永久关闭（含异常） | `ResetConnectionPool(error.Message)` → 销毁 `strSMB4Docker` → 退出 | `Environment.Exit(1)` |
+| 连接永久关闭（正常） | `CollectGcStats(DateTime.UtcNow.Ticks)` → 退出 | `Environment.Exit(1)` |
+| 挑战响应超时（10s） | 服务端发送 `ForceDisconnect`，客户端 `FlushTelemetryBuffer(0xE001)` | `Environment.Exit(1)` |
+| 挑战响应验证失败 | 服务端发送 `ForceDisconnect`，客户端 `FlushTelemetryBuffer(0xE001)` | `Environment.Exit(1)` |
+
+### 7.2 服务端侧
+
 | 场景 | 行为 |
 |---|---|
-| 5 秒内未收到加密授权码 | 超时，`strSMB4Docker = "超时未获取"` |
-| AES 解密失败 | 记录错误日志，`TrySetResult(false)` |
-| `CheckSMB()` 验证不通过 | 转为临时授权模式（`bTemper4QX=true`），运行一段时间后自动退出 |
-| 同 GUID 重复连接 | `Environment.Exit(1)` |
-| 连接永久关闭 | `Environment.Exit(1)` |
-| 挑战响应超时（10s） | 服务端发送 `ForceDisconnect`，客户端 `Environment.Exit(1)` |
-| 挑战响应验证失败 | 服务端发送 `ForceDisconnect`，客户端 `Environment.Exit(1)` |
-| 服务端凭证锁冲突 | 打印错误并 `Environment.Exit(1)` |
+| 凭证锁冲突（同机第二实例） | 打印错误并 `Environment.Exit(1)` |
+| Kestrel 绑定端口失败 | 抛出异常，进程退出 |
+
+### 7.3 临时授权模式
+
+当 Docker 授权验证不通过时，系统不会立即退出，而是进入"临时授权模式"（`bTemper4QX = true`）：
+
+- `GetLicenseRunType()` 返回 `LicenseRunType.Trial`
+- 系统可运行一段时间（由定时器控制），到期后自动退出
+- 此机制确保网络抖动或服务端短暂不可用时不会误杀正常运行的业务
+
+可通过授权 XML 的 `<supporttemper>` 节点控制是否启用此兜底策略（`true`=启用，`false`=禁用）。
 
 ---
 
@@ -740,20 +989,46 @@ K8s 环境下 `/var/tmp` 通过 hostPath 挂载到宿主机，凭证锁文件存
 
 ### 客户端 `AlarmCenterProperties.xml`
 
+位置：`{应用程序根目录}/data/AlarmCenter/AlarmCenterProperties.xml`
+
 ```xml
-<Properties name="HostServer">
-    <DockerHostIP value="host.docker.internal" />
-    <DockerHostPort value="5555" />
-</Properties>
+<?xml version="1.0" encoding="utf-8"?>
+<root>
+  <Properties name="HostServer">
+    <DockerHostIP value="" />
+    <!-- 服务端地址：留空/*/0.0.0.0 自动回退到 host.docker.internal -->
+    <DockerHostPort value="5000" />
+    <!-- 服务端端口，需与服务端 TcpPort 一致 -->
+  </Properties>
+</root>
 ```
 
 ### 授权 XML 文件
 
+位置：与 `AlarmCenterProperties.xml` 同目录，由 `StationItem.XMLDoc` 加载。文件通常以 `.xml` 为后缀，包含软件名称、GUID、注册码、授权模式等配置。
+
+Docker 授权模式（`mode=4`）的必要节点：
+
 ```xml
 <root>
   <guid>xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx</guid>
-  <!-- clientId，同时作为 AES 加密的 password -->
-  <sbm>...</sbm>
-  <!-- 授权注册码，用于 CheckSMB() 验证 -->
+  <!-- 全局唯一标识（clientId），同时作为 AES 加密的 password -->
+  <shibie>XXXX-XXXX-XXXX-XXXX-XXXX</shibie>
+  <!-- 授权注册码（5段V2格式），用于 CheckSMB() 精确匹配验证 -->
+  <shibie2>YYYY-YYYY-YYYY-YYYY-YYYY</shibie>
+  <!-- 可选：备选注册码 2（网络迁移备用） -->
+  <shibie3>ZZZZ-ZZZZ-ZZZZ-ZZZZ-ZZZZ</shibie3>
+  <!-- 可选：备选注册码 3 -->
+  <!-- 最多支持到 shibie6 -->
+  <mode>4</mode>
+  <!-- 授权模式：1=本地MAC 2=云端 3=仅时间 4=Docker容器 -->
+  <limitdate>2099-12-31</limitdate>
+  <!-- 授权有效期截止日期，超过此日期授权自动失效 -->
+  <supporttemper>false</supporttemper>
+  <!-- 是否启用临时授权兜底：true=授权失败时进入临时模式，false=直接退出 -->
+  <softname>YourProductName</softname>
+  <!-- 产品名称 -->
 </root>
 ```
+
+> **注意**：节点名必须为 `<shibie>`（不是 `<sbm>`），代码中通过 `GetElementsByTagName("shibie")` 查找。多注册码支持 `<shibie2>` 到 `<shibie6>`，通过 `GetSBMList()` 读取全部后由 `CheckSMB()` 逐一精确匹配。
