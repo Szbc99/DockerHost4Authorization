@@ -728,6 +728,21 @@ namespace DockerHost
             });
         }
 
+        private static void AddFingerprintElement(HardwareFingerprintInfo info, List<string> parts,
+            string name, string? value, bool? usedOverride = null)
+        {
+            bool used = usedOverride ?? !string.IsNullOrWhiteSpace(value);
+            if (used && !string.IsNullOrWhiteSpace(value))
+                parts.Add(value);
+
+            info.Elements.Add(new HardwareElement
+            {
+                Name = name,
+                Value = value ?? "",
+                Used = used && !string.IsNullOrWhiteSpace(value)
+            });
+        }
+
         // SHA256 前4字节 → 8位大写16进制
         private static string ComputeSha256Prefix(string input)
         {
@@ -775,6 +790,147 @@ namespace DockerHost
                 default: return 9;
             }
         }
+
+        private static bool IsStablePhysicalAdapterType(NetworkInterfaceType type)
+        {
+            switch (type)
+            {
+                case NetworkInterfaceType.Ethernet:
+                case NetworkInterfaceType.GigabitEthernet:
+                case NetworkInterfaceType.FastEthernetT:
+                case NetworkInterfaceType.FastEthernetFx:
+                case NetworkInterfaceType.Wireless80211:
+                    return true;
+                default:
+                    return false;
+            }
+        }
+
+        private static string GetAdapterExcludeReason(NetworkInterface adapter, string macHex)
+        {
+            if (string.IsNullOrWhiteSpace(macHex) || macHex.Length < 6)
+                return "empty or invalid MAC";
+
+            if (adapter.NetworkInterfaceType == NetworkInterfaceType.Loopback)
+                return "loopback adapter";
+
+            if (adapter.NetworkInterfaceType == NetworkInterfaceType.Tunnel)
+                return "tunnel adapter";
+
+            if (!IsStablePhysicalAdapterType(adapter.NetworkInterfaceType))
+                return $"unsupported adapter type: {adapter.NetworkInterfaceType}";
+
+            string text = $"{adapter.Name} {adapter.Description}".ToLowerInvariant();
+            string[] commonVirtualKeywords =
+            {
+                "virtual",
+                "docker",
+                "container",
+                "hyper-v",
+                "wsl",
+                "vmware",
+                "virtualbox",
+                "vboxnet",
+                "vmnet",
+                "qemu",
+                "parallels",
+                "bridge",
+                "tap",
+                "tun",
+                "vpn",
+                "wireguard",
+                "openvpn",
+                "zerotier",
+                "tailscale",
+                "loopback",
+                "pseudo"
+            };
+
+            foreach (string keyword in commonVirtualKeywords)
+            {
+                if (text.Contains(keyword))
+                    return $"virtual or unstable adapter keyword: {keyword}";
+            }
+
+            if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+            {
+                string[] windowsVirtualKeywords =
+                {
+                    "vethernet",
+                    "lightweight filter",
+                    "packet scheduler",
+                    "filter driver",
+                    "vmswitch extension",
+                    "native mac layer",
+                    "wfp 802.3",
+                    "qos packet",
+                    "npcap",
+                    "wan miniport",
+                    "wi-fi direct",
+                    "bluetooth",
+                    "kernel debug",
+                    "fortinet",
+                    "anyconnect",
+                    "checkpoint",
+                    "check point",
+                    "juniper",
+                    "sonicwall",
+                    "pptp",
+                    "l2tp",
+                    "sstp"
+                };
+
+                foreach (string keyword in windowsVirtualKeywords)
+                {
+                    if (text.Contains(keyword))
+                        return $"virtual or unstable adapter keyword: {keyword}";
+                }
+            }
+            else if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
+            {
+                string interfaceName = adapter.Name.ToLowerInvariant();
+                string[] linuxVirtualPrefixes =
+                {
+                    "docker",
+                    "br",
+                    "br-",
+                    "br_",
+                    "veth",
+                    "virbr",
+                    "bond",
+                    "team",
+                    "dummy",
+                    "macvlan",
+                    "ipvlan",
+                    "ovs",
+                    "cni",
+                    "flannel",
+                    "cali",
+                    "weave",
+                    "kube",
+                    "vxlan",
+                    "gre",
+                    "gretap",
+                    "sit",
+                    "ip6tnl",
+                    "tun",
+                    "tap",
+                    "wg",
+                    "zt",
+                    "tailscale",
+                    "lo"
+                };
+
+                foreach (string prefix in linuxVirtualPrefixes)
+                {
+                    if (interfaceName.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+                        return $"linux virtual adapter prefix: {prefix}";
+                }
+
+                string sysfsDevicePath = Path.Combine("/sys/class/net", adapter.Name, "device");
+                if (!Directory.Exists(sysfsDevicePath) && !File.Exists(sysfsDevicePath))
+                    return "linux adapter has no physical device in sysfs";
+            }
 
         private static bool IsStablePhysicalAdapterType(NetworkInterfaceType type)
         {
