@@ -487,8 +487,8 @@ namespace DockerHost
             {
                 string currentMacPart = GetString1(macInfo.SelectedMac);
                 string currentHardwareId = BuildHardwareId(currentMacPart, fingerprintInfo.Fingerprint, out _, out _);
-                if (!hardwareIds.Contains(currentHardwareId, StringComparer.OrdinalIgnoreCase))
-                    hardwareIds.Insert(0, currentHardwareId);
+                hardwareIds.RemoveAll(id => string.Equals(id, currentHardwareId, StringComparison.OrdinalIgnoreCase));
+                hardwareIds.Insert(0, currentHardwareId);
             }
 
             return hardwareIds;
@@ -502,7 +502,8 @@ namespace DockerHost
 
             foreach (MacAdapterInfo adapter in macInfo.Adapters
                 .Where(a => !a.Excluded && a.PhysicalAddress.Length >= 6)
-                .OrderBy(a => a.Priority)
+                .OrderByDescending(a => a.Selected)
+                .ThenBy(a => a.Priority)
                 .ThenBy(a => a.PhysicalAddress, StringComparer.OrdinalIgnoreCase))
             {
                 if (!seenMacs.Add(adapter.PhysicalAddress))
