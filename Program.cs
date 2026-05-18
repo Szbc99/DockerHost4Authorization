@@ -164,14 +164,16 @@ namespace DockerHost
                 }
             }
 
-            // 1. 获取硬件ID（作为明文）
-            var hardwareId = HardwareInfoGenerator.GenerateHardwareInfo();
+            // 1. 获取所有候选硬件ID（作为明文）
+            var hardwareIds = HardwareInfoGenerator.GenerateAllPhysicalHardwareIds(includeCurrentSelected: true);
             
             // 2. 使用客户端提供的参数进行加密
-            var encryptedId = EncryptionHelper.EncryptString(hardwareId, clientId, salt);
+            var encryptedIds = hardwareIds
+                .Select(id => EncryptionHelper.EncryptString(id, clientId, salt))
+                .ToArray();
             
             // 3. 将加密后的结果发送回调用方
-            await Clients.Caller.SendAsync("ReceiveEncryptedHardwareId", encryptedId);
+            await Clients.Caller.SendAsync("ReceiveEncryptedHardwareIds", encryptedIds);
         }
 
         // 客户端回应挑战：用硬件注册码对 nonce 做 HMAC-SHA256 签名
@@ -187,10 +189,11 @@ namespace DockerHost
                     return;
                 }
 
-                var hardwareId = HardwareInfoGenerator.GenerateHardwareInfo();
-                var expectedResponse = ComputeHmac(hardwareId, nonce);
+                var hardwareIds = HardwareInfoGenerator.GenerateAllPhysicalHardwareIds(includeCurrentSelected: true);
+                bool verified = hardwareIds.Any(hardwareId =>
+                    string.Equals(ComputeHmac(hardwareId, nonce), response, StringComparison.OrdinalIgnoreCase));
 
-                if (!string.Equals(expectedResponse, response, StringComparison.OrdinalIgnoreCase))
+                if (!verified)
                 {
                     Console.WriteLine($"[挑战] 客户端 {clientId} 响应验证失败");
                     await Clients.Caller.SendAsync("ForceDisconnect", "挑战验证失败");
@@ -246,7 +249,7 @@ namespace DockerHost
         public static void Main(string[] args)
         {
             // 在绑定端口前抢占凭证锁，防止通过修改端口绕过防多开
-            var hardwareId = HardwareInfoGenerator.GenerateHardwareInfo();
+            var hardwareId = HardwareInfoGenerator.GenerateHardwareInfo(writeStartupComparisonLog: true);
             AcquireLicenseLock(hardwareId);
 
             var builder = WebApplication.CreateBuilder(args);
@@ -438,27 +441,148 @@ namespace DockerHost
     // 生成基于硬件信息的注册码（V2：5段格式，与 DataCenter.GetSbmV2 保持一致）
     public static class HardwareInfoGenerator
     {
-        private static string _cachedHardwareFingerprint = null;
+        private static readonly object _generationLogLock = new object();
+        private static HardwareFingerprintInfo? _cachedHardwareFingerprintInfo = null;
 
         [Obfuscation(Feature = "virtualization", Exclude = false)]
-        public static string GenerateHardwareInfo()
+        public static string GenerateHardwareInfo(bool writeStartupComparisonLog = false)
         {
-            string macAddr = GetPrimaryMacAddress();
+            MacSelectionInfo macInfo = GetPrimaryMacAddressInfo();
+            string macAddr = macInfo.SelectedMac;
 
             // MAC 衍生部分（与 General.GetString1 一致）
             string macPart = GetString1(macAddr);
 
             // 硬件指纹部分（SHA256 前4字节 = 8位大写16进制）
-            string hwPart = GetHardwareFingerprint();
+            HardwareFingerprintInfo fingerprintInfo = GetHardwareFingerprintInfo();
+            string hwPart = fingerprintInfo.Fingerprint;
 
+            string hardwareId = BuildHardwareId(macPart, hwPart, out string raw, out string hex);
+
+            Dictionary<string, string> snapshot = BuildGenerationSnapshot(macInfo, macPart, fingerprintInfo, raw, hex, hardwareId);
+            WriteGenerationLog(snapshot);
+            if (writeStartupComparisonLog)
+                WriteStartupComparisonLog(snapshot);
+
+            return hardwareId;
+        }
+
+        public static List<PhysicalAdapterHardwareInfo> GenerateAllPhysicalAdapterHardwareInfos()
+        {
+            MacSelectionInfo macInfo = GetPrimaryMacAddressInfo();
+            HardwareFingerprintInfo fingerprintInfo = GetHardwareFingerprintInfo();
+            return BuildPhysicalAdapterHardwareInfos(macInfo, fingerprintInfo);
+        }
+
+        public static List<string> GenerateAllPhysicalHardwareIds(bool includeCurrentSelected = false)
+        {
+            MacSelectionInfo macInfo = GetPrimaryMacAddressInfo();
+            HardwareFingerprintInfo fingerprintInfo = GetHardwareFingerprintInfo();
+            var hardwareIds = BuildPhysicalAdapterHardwareInfos(macInfo, fingerprintInfo)
+                .Select(item => item.HardwareId)
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToList();
+
+            if (includeCurrentSelected && !string.IsNullOrWhiteSpace(macInfo.SelectedMac))
+            {
+                string currentMacPart = GetString1(macInfo.SelectedMac);
+                string currentHardwareId = BuildHardwareId(currentMacPart, fingerprintInfo.Fingerprint, out _, out _);
+                if (!hardwareIds.Contains(currentHardwareId, StringComparer.OrdinalIgnoreCase))
+                    hardwareIds.Insert(0, currentHardwareId);
+            }
+
+            return hardwareIds;
+        }
+
+        private static List<PhysicalAdapterHardwareInfo> BuildPhysicalAdapterHardwareInfos(
+            MacSelectionInfo macInfo, HardwareFingerprintInfo fingerprintInfo)
+        {
+            var result = new List<PhysicalAdapterHardwareInfo>();
+            var seenMacs = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            foreach (MacAdapterInfo adapter in macInfo.Adapters
+                .Where(a => !a.Excluded && a.PhysicalAddress.Length >= 6)
+                .OrderBy(a => a.Priority)
+                .ThenBy(a => a.PhysicalAddress, StringComparer.OrdinalIgnoreCase))
+            {
+                if (!seenMacs.Add(adapter.PhysicalAddress))
+                    continue;
+
+                string macPart = GetString1(adapter.PhysicalAddress);
+                string hardwareId = BuildHardwareId(macPart, fingerprintInfo.Fingerprint, out _, out _);
+                result.Add(new PhysicalAdapterHardwareInfo
+                {
+                    Name = adapter.Name,
+                    Description = adapter.Description,
+                    Status = adapter.Status,
+                    MacAddress = adapter.PhysicalAddress,
+                    HardwareId = hardwareId,
+                    Selected = adapter.Selected
+                });
+            }
+
+            return result;
+        }
+
+        private static string BuildHardwareId(string macPart, string hwPart, out string raw, out string hex)
+        {
             // 拼接后整体做 SHA256，取前10字节 = 20位16进制
-            string raw = macPart + "|" + hwPart;
+            raw = macPart + "|" + hwPart;
             using var sha256 = SHA256.Create();
             byte[] hash = sha256.ComputeHash(Encoding.UTF8.GetBytes(raw));
 
             // 倒序分组格式化为 XXXX-XXXX-XXXX-XXXX-XXXX
-            string hex = BitConverter.ToString(hash, 0, 10).Replace("-", "").ToUpper();
+            hex = BitConverter.ToString(hash, 0, 10).Replace("-", "").ToUpper();
             return $"{hex.Substring(16, 4)}-{hex.Substring(12, 4)}-{hex.Substring(8, 4)}-{hex.Substring(4, 4)}-{hex.Substring(0, 4)}";
+        }
+
+        public sealed class PhysicalAdapterHardwareInfo
+        {
+            public string Name { get; set; } = "";
+            public string Description { get; set; } = "";
+            public string Status { get; set; } = "";
+            public string MacAddress { get; set; } = "";
+            public string HardwareId { get; set; } = "";
+            public bool Selected { get; set; }
+        }
+
+        private sealed class HardwareElement
+        {
+            public string Name { get; set; } = "";
+            public string Value { get; set; } = "";
+            public bool Used { get; set; }
+            public string Note { get; set; } = "";
+        }
+
+        private sealed class HardwareFingerprintInfo
+        {
+            public string Fingerprint { get; set; } = "";
+            public string Combined { get; set; } = "";
+            public List<HardwareElement> Elements { get; } = new List<HardwareElement>();
+            public string Error { get; set; } = "";
+            public bool FromCache { get; set; }
+        }
+
+        private sealed class MacAdapterInfo
+        {
+            public string Name { get; set; } = "";
+            public string Description { get; set; } = "";
+            public string Type { get; set; } = "";
+            public string Status { get; set; } = "";
+            public string PhysicalAddress { get; set; } = "";
+            public bool IsLocallyAdministered { get; set; }
+            public int Priority { get; set; }
+            public bool Selected { get; set; }
+            public bool Excluded { get; set; }
+            public string ExcludeReason { get; set; } = "";
+        }
+
+        private sealed class MacSelectionInfo
+        {
+            public string SelectedMac { get; set; } = "";
+            public string FallbackMac { get; set; } = "unknow";
+            public List<MacAdapterInfo> Adapters { get; } = new List<MacAdapterInfo>();
+            public string Error { get; set; } = "";
         }
 
         // 与 General.GetString1 完全一致
@@ -478,9 +602,20 @@ namespace DockerHost
         [Obfuscation(Feature = "virtualization", Exclude = false)]
         private static string GetHardwareFingerprint()
         {
-            if (_cachedHardwareFingerprint != null) return _cachedHardwareFingerprint;
+            return GetHardwareFingerprintInfo().Fingerprint;
+        }
+
+        [Obfuscation(Feature = "virtualization", Exclude = false)]
+        private static HardwareFingerprintInfo GetHardwareFingerprintInfo()
+        {
+            if (_cachedHardwareFingerprintInfo != null)
+            {
+                _cachedHardwareFingerprintInfo.FromCache = true;
+                return _cachedHardwareFingerprintInfo;
+            }
 
             var parts = new List<string>();
+            var info = new HardwareFingerprintInfo();
             try
             {
                 if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
@@ -491,22 +626,46 @@ namespace DockerHost
                         using var cryptoKey = Microsoft.Win32.Registry.LocalMachine
                             .OpenSubKey(@"SOFTWARE\Microsoft\Cryptography");
                         string machineGuid = cryptoKey?.GetValue("MachineGuid")?.ToString() ?? "";
-                        if (!string.IsNullOrEmpty(machineGuid)) parts.Add(machineGuid);
+                        AddFingerprintElement(info, parts, "Windows.Registry.MachineGuid", machineGuid);
 
                         using var cpuKey = Microsoft.Win32.Registry.LocalMachine
                             .OpenSubKey(@"HARDWARE\DESCRIPTION\System\CentralProcessor\0");
                         string cpuId = cpuKey?.GetValue("Identifier")?.ToString() ?? "";
-                        if (!string.IsNullOrEmpty(cpuId)) parts.Add(cpuId);
+                        AddFingerprintElement(info, parts, "Windows.Registry.CpuIdentifier", cpuId);
 #pragma warning restore CA1416
                     }
-                    catch { }
+                    catch (Exception ex)
+                    {
+                        info.Elements.Add(new HardwareElement
+                        {
+                            Name = "Windows.Registry",
+                            Value = "",
+                            Used = false,
+                            Note = ex.Message
+                        });
+                    }
                 }
                 else
                 {
-                    string machineId = TryReadFileLine("/etc/machine-id");
+                    string? machineId = TryReadFileLine("/etc/machine-id");
+                    bool usedEtcMachineId = !string.IsNullOrWhiteSpace(machineId);
+                    AddFingerprintElement(info, parts, "Linux.File./etc/machine-id", machineId, usedEtcMachineId);
+
                     if (string.IsNullOrWhiteSpace(machineId))
+                    {
                         machineId = TryReadFileLine("/var/lib/dbus/machine-id");
-                    if (!string.IsNullOrWhiteSpace(machineId)) parts.Add(machineId);
+                        AddFingerprintElement(info, parts, "Linux.File./var/lib/dbus/machine-id", machineId);
+                    }
+                    else
+                    {
+                        info.Elements.Add(new HardwareElement
+                        {
+                            Name = "Linux.File./var/lib/dbus/machine-id",
+                            Value = "",
+                            Used = false,
+                            Note = "skipped because /etc/machine-id was used"
+                        });
+                    }
 
                     try
                     {
@@ -515,18 +674,57 @@ namespace DockerHost
                             string cpuModel = File.ReadLines("/proc/cpuinfo")
                                 .FirstOrDefault(l => l.StartsWith("model name", StringComparison.OrdinalIgnoreCase))
                                 ?.Split(':').LastOrDefault()?.Trim() ?? "";
-                            if (!string.IsNullOrEmpty(cpuModel)) parts.Add(cpuModel);
+                            AddFingerprintElement(info, parts, "Linux.File./proc/cpuinfo.model name", cpuModel);
+                        }
+                        else
+                        {
+                            info.Elements.Add(new HardwareElement
+                            {
+                                Name = "Linux.File./proc/cpuinfo.model name",
+                                Value = "",
+                                Used = false,
+                                Note = "file not found"
+                            });
                         }
                     }
-                    catch { }
+                    catch (Exception ex)
+                    {
+                        info.Elements.Add(new HardwareElement
+                        {
+                            Name = "Linux.File./proc/cpuinfo.model name",
+                            Value = "",
+                            Used = false,
+                            Note = ex.Message
+                        });
+                    }
                 }
             }
-            catch { }
+            catch (Exception ex)
+            {
+                info.Error = ex.Message;
+            }
 
             string combined = string.Join("|", parts.Where(p => !string.IsNullOrWhiteSpace(p)));
             string fingerprint = string.IsNullOrEmpty(combined) ? "NOHW0000" : ComputeSha256Prefix(combined);
-            _cachedHardwareFingerprint = fingerprint;
-            return fingerprint;
+            info.Combined = combined;
+            info.Fingerprint = fingerprint;
+            _cachedHardwareFingerprintInfo = info;
+            return info;
+        }
+
+        private static void AddFingerprintElement(HardwareFingerprintInfo info, List<string> parts,
+            string name, string? value, bool? usedOverride = null)
+        {
+            bool used = usedOverride ?? !string.IsNullOrWhiteSpace(value);
+            if (used && !string.IsNullOrWhiteSpace(value))
+                parts.Add(value);
+
+            info.Elements.Add(new HardwareElement
+            {
+                Name = name,
+                Value = value ?? "",
+                Used = used && !string.IsNullOrWhiteSpace(value)
+            });
         }
 
         // SHA256 前4字节 → 8位大写16进制
@@ -538,7 +736,7 @@ namespace DockerHost
         }
 
         // 读取文件第一个非空行
-        private static string TryReadFileLine(string path)
+        private static string? TryReadFileLine(string path)
         {
             try
             {
@@ -577,19 +775,167 @@ namespace DockerHost
             }
         }
 
+        private static bool IsStablePhysicalAdapterType(NetworkInterfaceType type)
+        {
+            switch (type)
+            {
+                case NetworkInterfaceType.Ethernet:
+                case NetworkInterfaceType.GigabitEthernet:
+                case NetworkInterfaceType.FastEthernetT:
+                case NetworkInterfaceType.FastEthernetFx:
+                case NetworkInterfaceType.Wireless80211:
+                    return true;
+                default:
+                    return false;
+            }
+        }
+
+        private static string GetAdapterExcludeReason(NetworkInterface adapter, string macHex)
+        {
+            if (string.IsNullOrWhiteSpace(macHex) || macHex.Length < 6)
+                return "empty or invalid MAC";
+
+            if (adapter.NetworkInterfaceType == NetworkInterfaceType.Loopback)
+                return "loopback adapter";
+
+            if (adapter.NetworkInterfaceType == NetworkInterfaceType.Tunnel)
+                return "tunnel adapter";
+
+            if (!IsStablePhysicalAdapterType(adapter.NetworkInterfaceType))
+                return $"unsupported adapter type: {adapter.NetworkInterfaceType}";
+
+            string text = $"{adapter.Name} {adapter.Description}".ToLowerInvariant();
+            string[] commonVirtualKeywords =
+            {
+                "virtual",
+                "docker",
+                "container",
+                "hyper-v",
+                "wsl",
+                "vmware",
+                "virtualbox",
+                "vboxnet",
+                "vmnet",
+                "qemu",
+                "parallels",
+                "bridge",
+                "tap",
+                "tun",
+                "vpn",
+                "wireguard",
+                "openvpn",
+                "zerotier",
+                "tailscale",
+                "loopback",
+                "pseudo"
+            };
+
+            foreach (string keyword in commonVirtualKeywords)
+            {
+                if (text.Contains(keyword))
+                    return $"virtual or unstable adapter keyword: {keyword}";
+            }
+
+            if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+            {
+                string[] windowsVirtualKeywords =
+                {
+                    "vethernet",
+                    "lightweight filter",
+                    "packet scheduler",
+                    "filter driver",
+                    "vmswitch extension",
+                    "native mac layer",
+                    "wfp 802.3",
+                    "qos packet",
+                    "npcap",
+                    "wan miniport",
+                    "wi-fi direct",
+                    "bluetooth",
+                    "kernel debug",
+                    "fortinet",
+                    "anyconnect",
+                    "checkpoint",
+                    "check point",
+                    "juniper",
+                    "sonicwall",
+                    "pptp",
+                    "l2tp",
+                    "sstp"
+                };
+
+                foreach (string keyword in windowsVirtualKeywords)
+                {
+                    if (text.Contains(keyword))
+                        return $"virtual or unstable adapter keyword: {keyword}";
+                }
+            }
+            else if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
+            {
+                string interfaceName = adapter.Name.ToLowerInvariant();
+                string[] linuxVirtualPrefixes =
+                {
+                    "docker",
+                    "br",
+                    "br-",
+                    "br_",
+                    "veth",
+                    "virbr",
+                    "bond",
+                    "team",
+                    "dummy",
+                    "macvlan",
+                    "ipvlan",
+                    "ovs",
+                    "cni",
+                    "flannel",
+                    "cali",
+                    "weave",
+                    "kube",
+                    "vxlan",
+                    "gre",
+                    "gretap",
+                    "sit",
+                    "ip6tnl",
+                    "tun",
+                    "tap",
+                    "wg",
+                    "zt",
+                    "tailscale",
+                    "lo"
+                };
+
+                foreach (string prefix in linuxVirtualPrefixes)
+                {
+                    if (interfaceName.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+                        return $"linux virtual adapter prefix: {prefix}";
+                }
+
+                string sysfsDevicePath = Path.Combine("/sys/class/net", adapter.Name, "device");
+                if (!Directory.Exists(sysfsDevicePath) && !File.Exists(sysfsDevicePath))
+                    return "linux adapter has no physical device in sysfs";
+            }
+
+            return "";
+        }
+
         // 选取主网卡 MAC（与 DataCenter.EvalSB4Local 中网卡选取逻辑一致）
         private static string GetPrimaryMacAddress()
         {
+            return GetPrimaryMacAddressInfo().SelectedMac;
+        }
+
+        private static MacSelectionInfo GetPrimaryMacAddressInfo()
+        {
             string tempaddr = string.Empty;
             string tempaddr1 = "unknow";
+            var info = new MacSelectionInfo();
 
             try
             {
                 NetworkInterface[] adapters = NetworkInterface.GetAllNetworkInterfaces();
 
                 var sortedAdapters = adapters
-                    .Where(a => a.NetworkInterfaceType != NetworkInterfaceType.Loopback
-                             && a.NetworkInterfaceType != NetworkInterfaceType.Tunnel)
                     .OrderBy(a => GetAdapterTypePriority(a.NetworkInterfaceType))
                     .ThenBy(a => a.GetPhysicalAddress().ToString())
                     .ToList();
@@ -597,7 +943,22 @@ namespace DockerHost
                 foreach (NetworkInterface adapter in sortedAdapters)
                 {
                     string addr = adapter.GetPhysicalAddress().ToString();
-                    if (addr.Length >= 6)
+                    string excludeReason = GetAdapterExcludeReason(adapter, addr);
+                    var adapterInfo = new MacAdapterInfo
+                    {
+                        Name = adapter.Name,
+                        Description = adapter.Description,
+                        Type = adapter.NetworkInterfaceType.ToString(),
+                        Status = adapter.OperationalStatus.ToString(),
+                        PhysicalAddress = addr,
+                        IsLocallyAdministered = IsLocallyAdministeredMac(addr),
+                        Priority = GetAdapterTypePriority(adapter.NetworkInterfaceType),
+                        Excluded = !string.IsNullOrWhiteSpace(excludeReason),
+                        ExcludeReason = excludeReason
+                    };
+                    info.Adapters.Add(adapterInfo);
+
+                    if (addr.Length >= 6 && string.IsNullOrWhiteSpace(excludeReason))
                     {
                         if (adapter.OperationalStatus == OperationalStatus.Up)
                         {
@@ -609,16 +970,301 @@ namespace DockerHost
                             if (shouldReplace)
                                 tempaddr = addr;
                         }
-                        tempaddr1 = addr;
+
+                        if (tempaddr1 == "unknow")
+                            tempaddr1 = addr;
                     }
                 }
 
                 if (tempaddr == string.Empty)
                     tempaddr = tempaddr1;
-            }
-            catch { }
 
-            return tempaddr ?? "unknow";
+                foreach (var adapter in info.Adapters)
+                    adapter.Selected = !adapter.Excluded
+                        && string.Equals(adapter.PhysicalAddress, tempaddr, StringComparison.OrdinalIgnoreCase);
+            }
+            catch (Exception ex)
+            {
+                info.Error = ex.Message;
+            }
+
+            info.SelectedMac = tempaddr ?? "unknow";
+            info.FallbackMac = tempaddr1;
+            return info;
         }
+
+        private static Dictionary<string, string> BuildGenerationSnapshot(MacSelectionInfo macInfo, string macPart,
+            HardwareFingerprintInfo fingerprintInfo, string raw, string hashHex, string hardwareId)
+        {
+            var snapshot = new Dictionary<string, string>();
+            snapshot["time.local"] = DateTime.Now.ToString("O");
+            snapshot["time.utc"] = DateTime.UtcNow.ToString("O");
+            snapshot["process.id"] = Environment.ProcessId.ToString();
+            snapshot["os.description"] = RuntimeInformation.OSDescription;
+            snapshot["os.architecture"] = RuntimeInformation.OSArchitecture.ToString();
+            snapshot["app.baseDirectory"] = AppContext.BaseDirectory;
+            snapshot["result.hardwareId"] = hardwareId;
+            snapshot["mac.selected"] = macInfo.SelectedMac;
+            snapshot["mac.fallback"] = macInfo.FallbackMac;
+            snapshot["mac.part"] = macPart;
+            snapshot["fingerprint.value"] = fingerprintInfo.Fingerprint;
+            snapshot["fingerprint.fromCache"] = fingerprintInfo.FromCache.ToString();
+            snapshot["fingerprint.combined"] = fingerprintInfo.Combined;
+            if (!string.IsNullOrWhiteSpace(fingerprintInfo.Error))
+                snapshot["fingerprint.error"] = fingerprintInfo.Error;
+            snapshot["final.raw"] = raw;
+            snapshot["final.sha256.first10bytes"] = hashHex;
+
+            for (int i = 0; i < fingerprintInfo.Elements.Count; i++)
+            {
+                HardwareElement element = fingerprintInfo.Elements[i];
+                string prefix = $"fingerprint.element.{i + 1}";
+                snapshot[$"{prefix}.name"] = element.Name;
+                snapshot[$"{prefix}.used"] = element.Used.ToString();
+                snapshot[$"{prefix}.value"] = element.Value;
+                if (!string.IsNullOrWhiteSpace(element.Note))
+                    snapshot[$"{prefix}.note"] = element.Note;
+            }
+
+            if (!string.IsNullOrWhiteSpace(macInfo.Error))
+                snapshot["mac.error"] = macInfo.Error;
+
+            var physicalRegistrations = BuildPhysicalAdapterHardwareInfos(macInfo, fingerprintInfo);
+            snapshot["registration.physical.count"] = physicalRegistrations.Count.ToString();
+            for (int i = 0; i < physicalRegistrations.Count; i++)
+            {
+                PhysicalAdapterHardwareInfo item = physicalRegistrations[i];
+                string prefix = $"registration.physical.{i + 1}";
+                snapshot[$"{prefix}.selected"] = item.Selected.ToString();
+                snapshot[$"{prefix}.name"] = item.Name;
+                snapshot[$"{prefix}.description"] = item.Description;
+                snapshot[$"{prefix}.status"] = item.Status;
+                snapshot[$"{prefix}.mac"] = item.MacAddress;
+                snapshot[$"{prefix}.hardwareId"] = item.HardwareId;
+            }
+
+            for (int i = 0; i < macInfo.Adapters.Count; i++)
+            {
+                MacAdapterInfo adapter = macInfo.Adapters[i];
+                string prefix = $"mac.adapter.{i + 1}";
+                snapshot[$"{prefix}.selected"] = adapter.Selected.ToString();
+                snapshot[$"{prefix}.name"] = adapter.Name;
+                snapshot[$"{prefix}.description"] = adapter.Description;
+                snapshot[$"{prefix}.type"] = adapter.Type;
+                snapshot[$"{prefix}.status"] = adapter.Status;
+                snapshot[$"{prefix}.physicalAddress"] = adapter.PhysicalAddress;
+                snapshot[$"{prefix}.isLocallyAdministered"] = adapter.IsLocallyAdministered.ToString();
+                snapshot[$"{prefix}.priority"] = adapter.Priority.ToString();
+                snapshot[$"{prefix}.excluded"] = adapter.Excluded.ToString();
+                if (!string.IsNullOrWhiteSpace(adapter.ExcludeReason))
+                    snapshot[$"{prefix}.excludeReason"] = adapter.ExcludeReason;
+            }
+
+            return snapshot;
+        }
+
+        private static void WriteGenerationLog(Dictionary<string, string> snapshot)
+        {
+            try
+            {
+                string logPath = GetGenerationLogPath();
+                string? logDir = Path.GetDirectoryName(logPath);
+                if (!string.IsNullOrWhiteSpace(logDir))
+                    Directory.CreateDirectory(logDir);
+
+                var sb = new StringBuilder();
+                sb.AppendLine("============================================================");
+                AppendSnapshot(sb, snapshot);
+
+                lock (_generationLogLock)
+                {
+                    File.AppendAllText(logPath, sb.ToString(), Encoding.UTF8);
+                }
+            }
+            catch
+            {
+                // 诊断日志不能影响注册码生成和授权流程。
+            }
+        }
+
+        private static void WriteStartupComparisonLog(Dictionary<string, string> currentSnapshot)
+        {
+            try
+            {
+                string diffLogPath = GetStartupComparisonLogPath();
+                string? diffLogDir = Path.GetDirectoryName(diffLogPath);
+                if (!string.IsNullOrWhiteSpace(diffLogDir))
+                    Directory.CreateDirectory(diffLogDir);
+
+                string snapshotPath = GetStartupSnapshotPath();
+                Dictionary<string, string> previousSnapshot = File.Exists(snapshotPath)
+                    ? ReadSnapshotFile(snapshotPath)
+                    : new Dictionary<string, string>();
+
+                var sb = new StringBuilder();
+                sb.AppendLine($"compare.time.local={NormalizeLogValue(DateTime.Now.ToString("O"))}");
+                sb.AppendLine($"compare.time.utc={NormalizeLogValue(DateTime.UtcNow.ToString("O"))}");
+                string currentHardwareId = GetSnapshotValue(currentSnapshot, "result.hardwareId");
+
+                if (previousSnapshot.Count == 0)
+                {
+                    sb.AppendLine("summary=没有找到上一次启动快照，本次仅保存当前启动快照，下一次启动开始对比。");
+                    sb.AppendLine($"current.result.hardwareId={NormalizeLogValue(currentHardwareId)}");
+                }
+                else
+                {
+                    string previousHardwareId = GetSnapshotValue(previousSnapshot, "result.hardwareId");
+                    sb.AppendLine($"previous.result.hardwareId={NormalizeLogValue(previousHardwareId)}");
+                    sb.AppendLine($"current.result.hardwareId={NormalizeLogValue(currentHardwareId)}");
+
+                    if (string.Equals(previousHardwareId, currentHardwareId, StringComparison.Ordinal))
+                    {
+                        sb.AppendLine("summary=注册码未变化，不展开启动要素对比。");
+                        sb.AppendLine("diff=注册码未变化");
+                    }
+                    else
+                    {
+                        var changedKeys = GetChangedKeys(previousSnapshot, currentSnapshot).ToList();
+                        sb.AppendLine($"summary=注册码发生变化，发现 {changedKeys.Count} 个启动要素差异。");
+
+                        if (changedKeys.Count == 0)
+                        {
+                            sb.AppendLine("diff=注册码变化，但未发现已记录要素差异。");
+                        }
+                        else
+                        {
+                            foreach (string key in changedKeys)
+                            {
+                                sb.AppendLine($"diff.{key}.previous={NormalizeLogValue(GetSnapshotValue(previousSnapshot, key))}");
+                                sb.AppendLine($"diff.{key}.current={NormalizeLogValue(GetSnapshotValue(currentSnapshot, key))}");
+                            }
+                        }
+                    }
+                }
+
+                lock (_generationLogLock)
+                {
+                    File.WriteAllText(diffLogPath, sb.ToString(), Encoding.UTF8);
+                    WriteSnapshotFile(snapshotPath, currentSnapshot);
+                }
+            }
+            catch
+            {
+                // 启动对比日志不能影响注册码生成和授权流程。
+            }
+        }
+
+        private static IEnumerable<string> GetChangedKeys(Dictionary<string, string> previousSnapshot,
+            Dictionary<string, string> currentSnapshot)
+        {
+            var ignoredKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+            {
+                "time.local",
+                "time.utc",
+                "process.id",
+                "fingerprint.fromCache",
+                "app.baseDirectory"
+            };
+
+            return previousSnapshot.Keys
+                .Union(currentSnapshot.Keys)
+                .Where(k => !ignoredKeys.Contains(k))
+                .Where(IsRegistrationFactorKey)
+                .Where(k => !string.Equals(NormalizeLogValue(GetSnapshotValue(previousSnapshot, k)),
+                    NormalizeLogValue(GetSnapshotValue(currentSnapshot, k)), StringComparison.Ordinal))
+                .OrderBy(k => k, StringComparer.OrdinalIgnoreCase);
+        }
+
+        private static bool IsRegistrationFactorKey(string key)
+        {
+            return key.StartsWith("result.", StringComparison.OrdinalIgnoreCase)
+                || key.StartsWith("mac.", StringComparison.OrdinalIgnoreCase)
+                || key.StartsWith("registration.", StringComparison.OrdinalIgnoreCase)
+                || key.StartsWith("fingerprint.", StringComparison.OrdinalIgnoreCase)
+                || key.StartsWith("final.", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static void AppendSnapshot(StringBuilder sb, Dictionary<string, string> snapshot)
+        {
+            foreach (var item in snapshot)
+                sb.AppendLine($"{item.Key}={NormalizeLogValue(item.Value)}");
+        }
+
+        private static Dictionary<string, string> ReadSnapshotFile(string path)
+        {
+            var snapshot = new Dictionary<string, string>();
+            foreach (string line in File.ReadLines(path, Encoding.UTF8))
+            {
+                int separatorIndex = line.IndexOf('=');
+                if (separatorIndex <= 0) continue;
+                string key = line.Substring(0, separatorIndex);
+                string value = line.Substring(separatorIndex + 1);
+                snapshot[key] = value;
+            }
+
+            return snapshot;
+        }
+
+        private static void WriteSnapshotFile(string path, Dictionary<string, string> snapshot)
+        {
+            string? snapshotDir = Path.GetDirectoryName(path);
+            if (!string.IsNullOrWhiteSpace(snapshotDir))
+                Directory.CreateDirectory(snapshotDir);
+
+            var sb = new StringBuilder();
+            AppendSnapshot(sb, snapshot);
+            File.WriteAllText(path, sb.ToString(), Encoding.UTF8);
+        }
+
+        private static string GetSnapshotValue(Dictionary<string, string> snapshot, string key)
+        {
+            return snapshot.TryGetValue(key, out string? value) ? value ?? "" : "<missing>";
+        }
+
+        private static string GetGenerationLogPath()
+        {
+            string? explicitLogPath = Environment.GetEnvironmentVariable("DOCKERHOST_REGISTRATION_LOG");
+            if (!string.IsNullOrWhiteSpace(explicitLogPath))
+                return explicitLogPath;
+
+            string? logDir = Environment.GetEnvironmentVariable("DOCKERHOST_REGISTRATION_LOG_DIR");
+            if (string.IsNullOrWhiteSpace(logDir))
+                logDir = Path.Combine(AppContext.BaseDirectory, "logs");
+
+            return Path.Combine(logDir, "hardware-registration.log");
+        }
+
+        private static string GetStartupComparisonLogPath()
+        {
+            string? explicitLogPath = Environment.GetEnvironmentVariable("DOCKERHOST_REGISTRATION_DIFF_LOG");
+            if (!string.IsNullOrWhiteSpace(explicitLogPath))
+                return explicitLogPath;
+
+            string? logDir = Environment.GetEnvironmentVariable("DOCKERHOST_REGISTRATION_LOG_DIR");
+            if (string.IsNullOrWhiteSpace(logDir))
+                logDir = Path.Combine(AppContext.BaseDirectory, "logs");
+
+            return Path.Combine(logDir, "hardware-registration-startup-diff.log");
+        }
+
+        private static string GetStartupSnapshotPath()
+        {
+            string? explicitSnapshotPath = Environment.GetEnvironmentVariable("DOCKERHOST_REGISTRATION_STARTUP_SNAPSHOT");
+            if (!string.IsNullOrWhiteSpace(explicitSnapshotPath))
+                return explicitSnapshotPath;
+
+            string? logDir = Environment.GetEnvironmentVariable("DOCKERHOST_REGISTRATION_LOG_DIR");
+            if (string.IsNullOrWhiteSpace(logDir))
+                logDir = Path.Combine(AppContext.BaseDirectory, "logs");
+
+            return Path.Combine(logDir, "hardware-registration-startup-last.snapshot");
+        }
+
+        private static string NormalizeLogValue(string? value)
+        {
+            if (value == null) return "";
+            return value.Replace("\r", "\\r").Replace("\n", "\\n");
+        }
+
     }
 }
